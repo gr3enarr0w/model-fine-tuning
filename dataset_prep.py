@@ -331,9 +331,29 @@ def stream_agentic(target_count: int) -> Iterator[dict]:
 # Main
 # ---------------------------------------------------------------------------
 
+def parse_args():
+    """Parse CLI args. --limit N caps each source for smoke testing."""
+    import argparse
+    p = argparse.ArgumentParser(description="Prepare fine-tuning data.")
+    p.add_argument("--limit", type=int, default=None,
+        help="Cap examples per source for smoke testing (e.g. --limit 200)")
+    return p.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     random.seed(SEED)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Apply --limit to reduce targets for smoke testing
+    if args.limit:
+        print(f"[SMOKE TEST] Limiting each source to {args.limit} examples")
+        targets = {k: min(v, max(1, args.limit * v // CODEALCHEMY_TOTAL))
+                   for k, v in CODEALCHEMY_TARGETS.items()}
+        agentic_limit = args.limit
+    else:
+        targets = CODEALCHEMY_TARGETS
+        agentic_limit = AGENTIC_TOTAL
 
     all_records: list[dict] = []
     stats: dict[str, dict] = {
@@ -354,7 +374,7 @@ def main() -> None:
     print("Phase 1: CodeAlchemy")
     print("=" * 60)
 
-    for record, type_label, lang in stream_codealchemy(CODEALCHEMY_TARGETS):
+    for record, type_label, lang in stream_codealchemy(targets):
         all_records.append(record)
         stats["codealchemy"]["by_type"][type_label] += 1
         stats["codealchemy"]["by_language"][lang] += 1
@@ -367,7 +387,7 @@ def main() -> None:
     print("Phase 2: Agentic SFT")
     print("=" * 60)
 
-    for record in stream_agentic(AGENTIC_TOTAL):
+    for record in stream_agentic(agentic_limit):
         all_records.append(record)
         stats["agentic"]["total"] += 1
 
