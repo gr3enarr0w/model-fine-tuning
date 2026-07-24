@@ -91,7 +91,10 @@ image = (
     ],
     memory=65536,              # 64 GB RAM to handle tokenization buffers
 )
-def train() -> None:
+def train(
+    limit: int | None = None,
+    max_steps_override: int = -1,
+) -> None:
     """
     Full QLoRA fine-tuning pipeline with automated hyperparameter strategies:
 
@@ -333,8 +336,14 @@ def train() -> None:
     formatted_ds = raw_ds.map(format_chatml, remove_columns=raw_ds.column_names)
     print(f"Sample formatted example:\n{formatted_ds[0]['text'][:400]}...")
 
+    # --limit: cap dataset size for smoke testing
+    if limit is not None:
+        cap = min(limit, len(formatted_ds))
+        formatted_ds = formatted_ds.select(range(cap))
+        print(f"[Smoke] --limit applied: using {cap:,} of {num_examples:,} examples.")
+
     # Split off a small eval set for early stopping (5% or max 500 examples)
-    eval_size = min(500, max(1, int(num_examples * 0.05)))
+    eval_size = min(500, max(1, int(len(formatted_ds) * 0.05)))
     split = formatted_ds.train_test_split(test_size=eval_size, seed=42)
     train_ds = split["train"]
     eval_ds = split["test"]
@@ -353,6 +362,12 @@ def train() -> None:
     )
     steps_per_epoch = math.ceil(len(train_ds) / effective_batch)
     max_steps = steps_per_epoch * cfg["max_epochs"]
+
+    # --max-steps-override: override computed value for smoke testing
+    if max_steps_override > 0:
+        max_steps = max_steps_override
+        print(f"[Smoke] --max-steps override: {max_steps}")
+
     print(f"\n[AutoHP] effective_batch : {effective_batch} "
           f"(bs={cfg['per_device_train_batch_size']} × accum={cfg['gradient_accumulation_steps']} × gpus={n_gpus})")
     print(f"[AutoHP] steps_per_epoch : {steps_per_epoch}")
@@ -633,13 +648,19 @@ def train() -> None:
 # ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
-def main() -> None:
+def main(
+    limit: int = 0,
+    max_steps: int = -1,
+) -> None:
     """
     Trigger the remote training job.
 
     Run with:
-        modal run train.py            # blocks until done (prints logs live)
-        modal run train.py --detach   # fire-and-forget (recommended for long runs)
+        modal run train.py                          # blocks until done (prints logs live)
+        modal run train.py --detach                 # fire-and-forget (recommended for long runs)
+        modal run train.py --limit 500              # smoke test: cap at 500 examples
+        modal run train.py --max-steps 50           # smoke test: stop after 50 steps
+        modal run train.py --limit 500 --max-steps 50  # both together
 
     Retrieve the adapter after training:
         modal volume get laguna-codealchemy-vol /outputs/final-adapter ./final-adapter
@@ -649,5 +670,12 @@ def main() -> None:
     print("  Timeout : 7 hours")
     print("  Volume  : laguna-codealchemy-vol")
     print("  Output  : /outputs/final-adapter/")
+    if limit > 0:
+        print(f"  [Smoke] limit      : {limit} examples")
+    if max_steps > 0:
+        print(f"  [Smoke] max-steps  : {max_steps}")
     print()
-    train.remote()
+    train.remote(
+        limit=limit if limit > 0 else None,
+        max_steps_override=max_steps,
+    )

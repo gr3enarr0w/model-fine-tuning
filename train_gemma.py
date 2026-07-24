@@ -75,7 +75,24 @@ def parse_args() -> argparse.Namespace:
         default="outputs",
         help="Root directory for saving trained adapter weights.",
     )
-    return p.parse_args()
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap total training examples for smoke testing (e.g. --limit 500)",
+    )
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=-1,
+        help="Override max training steps, -1 = auto from dataset size (e.g. --max-steps 50 for smoke test)",
+    )
+    args = p.parse_args()
+    if args.strategy == "per-language" and not args.language:
+        p.error("--language is required when --strategy is per-language")
+    if args.strategy == "generalist" and args.language:
+        p.error("--language must not be set when --strategy is generalist")
+    return args
 
 
 def load_config(path: str) -> dict:
@@ -393,13 +410,9 @@ def main() -> None:
       5. Early stopping via EarlyStoppingCallback (patience from config)
 
     Raises:
-        ValueError: If --language is omitted for per-language strategy.
         FileNotFoundError: If the training data file does not exist.
     """
     args = parse_args()
-
-    if args.strategy == "per-language" and not args.language:
-        raise ValueError("--language is required when --strategy is per-language")
 
     cfg = load_config(args.config)
     data_path, output_path = resolve_paths(args)
@@ -521,8 +534,14 @@ def main() -> None:
 
     formatted_ds = raw_ds.map(format_chatml, remove_columns=raw_ds.column_names)
 
+    # --limit: cap dataset size for smoke testing
+    if args.limit is not None:
+        cap = min(args.limit, len(formatted_ds))
+        formatted_ds = formatted_ds.select(range(cap))
+        print(f"[Smoke] --limit applied: using {cap:,} of {num_examples:,} examples.")
+
     # Split off eval set (5% or max 500 examples)
-    eval_size = min(500, max(1, int(num_examples * 0.05)))
+    eval_size = min(500, max(1, int(len(formatted_ds) * 0.05)))
     split = formatted_ds.train_test_split(test_size=eval_size, seed=42)
     train_ds = split["train"]
     eval_ds = split["test"]
@@ -544,6 +563,11 @@ def main() -> None:
     )
     steps_per_epoch = math.ceil(len(train_ds) / effective_batch)
     max_steps = steps_per_epoch * cfg.get("max_epochs", 5)
+
+    # --max-steps: override computed value for smoke testing
+    if args.max_steps > 0:
+        max_steps = args.max_steps
+        print(f"[Smoke] --max-steps override: {max_steps}")
 
     print(f"\n[AutoHP] effective_batch : {effective_batch}")
     print(f"[AutoHP] steps_per_epoch : {steps_per_epoch}")
