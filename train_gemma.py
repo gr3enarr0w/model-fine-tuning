@@ -81,7 +81,7 @@ gemma_image = (
 
 @app.function(
     gpu="a10g",
-    timeout=4 * 3600,          # 4-hour hard cap per language
+    timeout=14 * 3600,         # 14-hour hard cap (was 4h; extended for HF streaming)
     volumes={
         "/data": volume,
         "/outputs": volume,

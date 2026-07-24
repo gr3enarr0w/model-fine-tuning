@@ -11,8 +11,11 @@ Free credits cover this comfortably within the $30 allowance.
 Before running:
     1. modal secret create huggingface-token HF_TOKEN=hf_...
     2. modal volume create laguna-codealchemy-vol
-    3. Upload data:  modal volume put laguna-codealchemy-vol data/train.jsonl /data/train.jsonl
-    4. (Optional) modal secret create wandb-token WANDB_API_KEY=...
+    3. (Optional) modal secret create wandb-token WANDB_API_KEY=...
+
+Note: Training data is now streamed directly from HuggingFace at runtime —
+no local upload required. Sources: open-alchemy/code-alchemy (all 5 configs)
++ WaltonFuture/agentic-sft-new.
 
 Automated hyperparameter strategies
 ------------------------------------
@@ -81,7 +84,7 @@ image = (
 
 @app.function(
     gpu="a100-40gb",
-    timeout=7 * 3600,          # 7-hour hard cap (run typically finishes in 4-6h)
+    timeout=14 * 3600,         # 14-hour hard cap (was 7h; HF streaming runs longer)
     volumes={
         "/data": volume,
         "/outputs": volume,
@@ -201,7 +204,6 @@ def train(
     MODEL_NAME: str = cfg["model_name"]
     OUTPUT_DIR: str = cfg["output_dir"]
     FINAL_ADAPTER_DIR = "/outputs/final-adapter"
-    DATA_PATH = Path("/data/train.jsonl")
 
     print("\n=== Training config ===")
     for k, v in cfg.items():
@@ -211,12 +213,7 @@ def train(
     # -----------------------------------------------------------------------
     # 1. Sanity checks
     # -----------------------------------------------------------------------
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(
-            f"Training data not found at {DATA_PATH}.\n"
-            "Upload it first:\n"
-            "  modal volume put laguna-codealchemy-vol data/train.jsonl /data/train.jsonl"
-        )
+    # Training data is streamed directly from HuggingFace — no local file needed.
 
     hf_token = os.environ.get("HF_TOKEN")
     if not hf_token:
@@ -318,8 +315,215 @@ def train(
     # 4. ACT controller helpers
     # -----------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # HuggingFace streaming helpers (replaces local load_jsonl)
+    # ------------------------------------------------------------------
+
+    # Dataset / config constants — same as dataset_prep.py
+    _HF_CODEALCHEMY = "open-alchemy/code-alchemy"
+    _HF_AGENTIC = "WaltonFuture/agentic-sft-new"
+    _HF_CA_CONFIGS = ["code-dev", "code-dialogue", "code-trace", "code-enhance", "code-qa"]
+    _HF_CA_PLACEHOLDER_CONFIGS = {"code-dev", "code-dialogue"}
+    _HF_CA_USER_PROMPTS = {
+        "code-dev": "Complete the following developer task:",
+        "code-dialogue": "Continue this development conversation:",
+        "code-trace": "Analyze this code execution trace:",
+        "code-enhance": "Review and improve this code:",
+        "code-qa": "Answer this code question:",
+    }
+    _HF_SYSTEM_PROMPT = (
+        "You are an expert software engineer working on a long-horizon coding task. "
+        "You write clean, tested, production-quality code."
+    )
+
+    def _hf_extract_record(example: dict, config_name: str) -> dict | None:
+        """Convert a raw HF example into a ChatML messages dict."""
+        import hashlib
+
+        # WaltonFuture/agentic-sft-new: already has messages list
+        if config_name == "__agentic__":
+            messages = example.get("messages") or example.get("conversations")
+            if not messages or not isinstance(messages, list):
+                return None
+            # normalise role names
+            normed = []
+            for m in messages:
+                role = str(m.get("role") or m.get("from") or "").lower()
+                content = str(m.get("content") or m.get("value") or "").strip()
+                if role in ("human", "user"):
+                    role = "user"
+                elif role in ("gpt", "assistant"):
+                    role = "assistant"
+                if content:
+                    normed.append({"role": role, "content": content})
+            if not normed:
+                return None
+            if normed[0]["role"] != "system":
+                normed.insert(0, {"role": "system", "content": _HF_SYSTEM_PROMPT})
+            return {"messages": normed}
+
+        # CodeAlchemy configs
+        if config_name in _HF_CA_PLACEHOLDER_CONFIGS:
+            raw_text = str(example.get("text_with_placeholders", "") or "").strip()
+        else:
+            raw_text = str(example.get("text", "") or "").strip()
+        if not raw_text:
+            return None
+        user_turn = _HF_CA_USER_PROMPTS.get(config_name, "Complete the following coding task:")
+        return {
+            "messages": [
+                {"role": "system", "content": _HF_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_turn},
+                {"role": "assistant", "content": raw_text},
+            ]
+        }
+
+    def stream_hf_batch(batch_idx: int, batch_size: int = 50_000) -> list[dict]:
+        """
+        Stream one batch of training examples from HuggingFace.
+
+        Covers CodeAlchemy (all 5 configs) + WaltonFuture/agentic-sft-new.
+        Skips batch_idx * batch_size rows globally (round-robin across sources),
+        deduplicates on SHA-256 of the assistant content, and returns up to
+        batch_size records formatted as ChatML messages dicts.
+
+        Args:
+            batch_idx:  0-based batch index (used to compute skip offset).
+            batch_size: Target number of examples to return.
+
+        Returns:
+            List of dicts with {"messages": [...]} in ChatML format.
+        """
+        from datasets import load_dataset
+        from tqdm import tqdm
+
+        skip = batch_idx * batch_size
+        # Allocate budget evenly across all 6 sources (5 CA configs + 1 agentic)
+        n_sources = len(_HF_CA_CONFIGS) + 1   # 6
+        per_source = batch_size // n_sources
+        skip_per_source = skip // n_sources
+
+        records: list[dict] = []
+        seen_hashes: set[str] = set()
+
+        def _collect(ds_iter, config_name: str, target: int, skip_n: int) -> None:
+            import hashlib
+            collected = 0
+            skipped = 0
+            for example in tqdm(ds_iter, desc=f"HF:{config_name}", unit="ex", leave=False):
+                if skipped < skip_n:
+                    skipped += 1
+                    continue
+                rec = _hf_extract_record(example, config_name)
+                if rec is None:
+                    continue
+                asst_content = next(
+                    (m["content"] for m in reversed(rec["messages"]) if m["role"] == "assistant"),
+                    "",
+                )
+                h = hashlib.sha256(asst_content[:512].encode("utf-8", errors="replace")).hexdigest()
+                if h in seen_hashes:
+                    continue
+                seen_hashes.add(h)
+                records.append(rec)
+                collected += 1
+                if collected >= target:
+                    break
+            print(f"  [HF] {config_name}: collected {collected:,} (skip={skip_n:,})")
+
+        # Stream CodeAlchemy configs
+        for config_name in _HF_CA_CONFIGS:
+            try:
+                ds = load_dataset(
+                    _HF_CODEALCHEMY,
+                    name=config_name,
+                    streaming=True,
+                    trust_remote_code=True,
+                )
+                split = ds.get("train", ds[next(iter(ds))])
+                _collect(split, config_name, per_source, skip_per_source)
+            except Exception as exc:
+                print(f"  [HF] WARNING: could not load {_HF_CODEALCHEMY}/{config_name}: {exc}")
+
+        # Stream WaltonFuture/agentic-sft-new
+        try:
+            ds = load_dataset(_HF_AGENTIC, streaming=True, trust_remote_code=True)
+            split = ds.get("train", ds[next(iter(ds))])
+            _collect(split, "__agentic__", per_source, skip_per_source)
+        except Exception as exc:
+            print(f"  [HF] WARNING: could not load {_HF_AGENTIC}: {exc}")
+
+        print(f"[HF] stream_hf_batch(idx={batch_idx}) → {len(records):,} records")
+        return records
+
+    def stream_hf_val(n: int = 5_000, skip: int = 5_000_000) -> list[dict]:
+        """
+        Stream a fixed validation set from HuggingFace.
+
+        Uses a consistent skip offset (default 5M) so the same examples are
+        returned on every call regardless of which ACT batch is running.
+
+        Args:
+            n:    Number of validation examples to collect.
+            skip: Row offset into the combined stream before collecting.
+
+        Returns:
+            List of ChatML messages dicts.
+        """
+        from datasets import load_dataset
+        from tqdm import tqdm
+        import hashlib
+
+        records: list[dict] = []
+        seen_hashes: set[str] = set()
+
+        # Pull val examples from CodeAlchemy code-qa (stable, diverse)
+        # then pad with agentic if needed.
+        sources = [
+            (_HF_CODEALCHEMY, "code-qa"),
+            (_HF_CODEALCHEMY, "code-enhance"),
+            (_HF_AGENTIC,     "__agentic__"),
+        ]
+        per_source = (n + len(sources) - 1) // len(sources)
+        skip_per = skip // len(sources)
+
+        for ds_name, config_name in sources:
+            if len(records) >= n:
+                break
+            try:
+                if config_name == "__agentic__":
+                    ds = load_dataset(ds_name, streaming=True, trust_remote_code=True)
+                else:
+                    ds = load_dataset(ds_name, name=config_name, streaming=True, trust_remote_code=True)
+                split = ds.get("train", ds[next(iter(ds))])
+                needed = min(per_source, n - len(records))
+                skipped = 0
+                for example in tqdm(split, desc=f"val:{config_name}", unit="ex", leave=False):
+                    if skipped < skip_per:
+                        skipped += 1
+                        continue
+                    rec = _hf_extract_record(example, config_name)
+                    if rec is None:
+                        continue
+                    asst_content = next(
+                        (m["content"] for m in reversed(rec["messages"]) if m["role"] == "assistant"),
+                        "",
+                    )
+                    h = hashlib.sha256(asst_content[:512].encode("utf-8", errors="replace")).hexdigest()
+                    if h in seen_hashes:
+                        continue
+                    seen_hashes.add(h)
+                    records.append(rec)
+                    if len(records) >= n:
+                        break
+            except Exception as exc:
+                print(f"  [HF] WARNING: could not load val from {ds_name}/{config_name}: {exc}")
+
+        print(f"[HF] stream_hf_val() → {len(records):,} val records")
+        return records
+
     def load_jsonl(path: Path) -> list[dict]:
-        """Load a JSONL file into a list of dicts."""
+        """Load a JSONL file into a list of dicts (used for temp val files)."""
         records = []
         with path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -459,17 +663,18 @@ def train(
         model: object,
         tokenizer: object,
         cfg: dict,
-        data_path: str,
-        val_path: str,
-        output_dir: str,
         batch_size: int = 50_000,
         epsilon: float = 0.005,
         max_batches: int = 4,
         max_steps_override: int = -1,
+        output_dir: str = "/outputs",
+        # Legacy params kept for call-site compatibility but ignored:
+        data_path: str = "",
+        val_path: str = "",
     ) -> float:
         """
-        ACT (Auto-Train Controller): feeds data in batches, stops when val loss
-        improvement drops below epsilon. Returns final best val loss.
+        ACT (Auto-Train Controller): streams data in batches from HuggingFace,
+        stops when val loss improvement drops below epsilon.
 
         Based on: ACT: Auto-Train for Code Translation Framework (2025)
 
@@ -477,41 +682,55 @@ def train(
             model: LoRA-wrapped model.
             tokenizer: Model tokenizer.
             cfg: Training config dict.
-            data_path: Path to train.jsonl (full dataset).
-            val_path: Path to val.jsonl (fixed validation set).
-            output_dir: Directory for checkpoints.
-            batch_size: Number of examples per ACT batch.
+            batch_size: Number of examples per ACT batch (streamed from HF).
             epsilon: Minimum val loss improvement required to continue.
             max_batches: Hard ceiling on number of batches (budget guard).
             max_steps_override: Passed through to train_on_batch for smoke tests.
+            output_dir: Directory for checkpoints.
+            data_path: Ignored (kept for backwards compat).
+            val_path: Ignored (kept for backwards compat).
 
         Returns:
             Best validation loss achieved across all batches.
         """
-        print(f"\n[ACT] Loading full dataset from {data_path}...")
-        all_records = load_jsonl(Path(data_path))
-        total = len(all_records)
-        print(f"[ACT] Total records: {total:,}  |  batch_size={batch_size:,}  |  max_batches={max_batches}  |  ε={epsilon}")
+        print(f"\n[ACT] Streaming training data from HuggingFace "
+              f"batch_size={batch_size:,}  max_batches={max_batches}  ε={epsilon}")
+
+        # Stream a fixed validation set once — consistent across all ACT batches
+        print("[ACT] Streaming fixed validation set (5k examples at offset 5M)...")
+        val_records = stream_hf_val(n=5_000, skip=5_000_000)
 
         best_val_loss = float("inf")
+        total_seen = 0
 
         for batch_idx in range(max_batches):
-            batch_start = batch_idx * batch_size
-            batch_end = min(batch_start + batch_size, total)
-            batch = all_records[batch_start:batch_end]
+            print(f"\n[ACT] Streaming batch {batch_idx + 1}/{max_batches} from HuggingFace...")
+            batch = stream_hf_batch(batch_idx=batch_idx, batch_size=batch_size)
 
             if not batch:
-                print(f"[ACT] No more data at batch {batch_idx}. Stopping.")
+                print(f"[ACT] No data returned for batch {batch_idx}. Stopping.")
                 break
 
+            total_seen += len(batch)
             print(f"\n[ACT] Batch {batch_idx + 1}/{max_batches}: {len(batch):,} examples "
-                  f"(rows {batch_start:,}–{batch_end:,}; total seen: {batch_end:,})")
+                  f"(total seen: {total_seen:,})")
+
+            # Write val records to a temp in-memory path for train_on_batch
+            # We pass val records directly — reuse the existing helper but use
+            # a /tmp file so train_on_batch can load it via load_jsonl path.
+            import tempfile
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+            ) as tmp_val:
+                for rec in val_records:
+                    tmp_val.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                tmp_val_path = tmp_val.name
 
             batch_val_loss = train_on_batch(
                 model,
                 tokenizer,
                 batch,
-                val_path,
+                tmp_val_path,
                 cfg,
                 output_dir,
                 max_steps_override=max_steps_override,
@@ -529,11 +748,7 @@ def train(
                       f"Data saturated. Stopping.")
                 break
 
-            if batch_end >= total:
-                print(f"[ACT] All {total:,} examples consumed. Stopping.")
-                break
-
-            print(f"[ACT] Still improving. Loading next batch...")
+            print(f"[ACT] Still improving. Streaming next batch...")
 
         print(f"\n[ACT] Final best val loss: {best_val_loss:.4f}")
         return best_val_loss
@@ -671,9 +886,9 @@ def train(
             return fallback_lr
 
     # Run the LR finder against a small warm-up slice to find initial LR.
-    # We need at least a minimal dataset for the sweep — use a 200-record stub
-    # that is formatted as expected (list of dicts with "text" key).
-    _lr_stub_records = load_jsonl(DATA_PATH)[:200]
+    # Stream 200 examples from HuggingFace (batch 0, truncated).
+    print("[LR stub] Streaming 200 examples from HuggingFace for LR finder...")
+    _lr_stub_records = stream_hf_batch(batch_idx=0, batch_size=200)
     from datasets import Dataset as _HFDataset
     _lr_stub_ds = _HFDataset.from_list(_lr_stub_records)
     _lr_stub_formatted = _lr_stub_ds.map(format_chatml, remove_columns=_lr_stub_ds.column_names)
@@ -710,8 +925,6 @@ def train(
     # -----------------------------------------------------------------------
     # 6. Run ACT controller (or single-pass if use_act=False)
     # -----------------------------------------------------------------------
-    VAL_PATH = "/data/val.jsonl"
-
     print("\nStarting ACT-controlled training...")
     t0 = time.time()
 
@@ -721,8 +934,6 @@ def train(
             model=model,
             tokenizer=tokenizer,
             cfg=cfg,
-            data_path=str(DATA_PATH),
-            val_path=VAL_PATH,
             output_dir=OUTPUT_DIR,
             batch_size=act_batch_size,
             epsilon=act_epsilon,
@@ -730,14 +941,22 @@ def train(
             max_steps_override=max_steps_override,
         )
     else:
-        # Legacy single-pass: load everything, train once (for smoke/debug)
-        print("[ACT] mode=OFF — single-pass training on full dataset")
-        all_records = load_jsonl(DATA_PATH)
+        # Legacy single-pass: stream one batch, train once (for smoke/debug)
+        print("[ACT] mode=OFF — single-pass training on one streamed batch")
+        all_records = stream_hf_batch(batch_idx=0, batch_size=act_batch_size)
+        val_records = stream_hf_val(n=2_000, skip=5_000_000)
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+        ) as tmp_val:
+            for rec in val_records:
+                tmp_val.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            tmp_val_path = tmp_val.name
         final_val_loss = train_on_batch(
             model=model,
             tokenizer=tokenizer,
             batch_records=all_records,
-            val_path_str=VAL_PATH,
+            val_path_str=tmp_val_path,
             cfg=cfg,
             output_dir=OUTPUT_DIR,
             max_steps_override=max_steps_override,
