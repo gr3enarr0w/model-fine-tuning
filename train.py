@@ -49,7 +49,7 @@ volume = modal.Volume.from_name("laguna-codealchemy-vol", create_if_missing=True
 # Unsloth is installed last because it pins specific torch/cuda versions;
 # installing it after the others lets pip resolve cleanly.
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry("nvidia/cuda:12.1.0-devel-ubuntu22.04", add_python="3.11")
     .pip_install(
         # Core ML stack — pin torch to a CUDA 12.1 wheel that Unsloth expects
         "torch==2.4.1",
@@ -254,6 +254,7 @@ def train(
             load_in_4bit=cfg["load_in_4bit"],
             dtype=None,      # Unsloth auto-selects BF16 on A100
             token=hf_token,
+            trust_remote_code=True,
         )
         USE_UNSLOTH = True
         print("Unsloth loaded successfully.")
@@ -271,12 +272,13 @@ def train(
             bnb_4bit_compute_dtype=getattr(torch, cfg["bnb_4bit_compute_dtype"]),
         )
 
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=hf_token)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=hf_token, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             quantization_config=bnb_cfg,
             device_map="auto",
             token=hf_token,
+            trust_remote_code=True,
         )
 
     # Ensure tokenizer has a pad token (needed for batch training)
