@@ -23,6 +23,8 @@ Automated hyperparameter strategies
   Batch size  : auto_find_batch_size=True in TrainingArguments (TRL)
   Epochs      : early stopping (patience=3) instead of a fixed epoch count
   max_steps   : derived at runtime from dataset size × epochs × batch
+  Data volume : ACT controller — feeds 50k-example batches, stops when val loss
+                improvement < epsilon (0.005); hard ceiling of 4 batches (200k)
 """
 
 from __future__ import annotations
@@ -92,8 +94,11 @@ image = (
     memory=65536,              # 64 GB RAM to handle tokenization buffers
 )
 def train(
-    limit: int | None = None,
     max_steps_override: int = -1,
+    use_act: bool = True,
+    act_batch_size: int = 50_000,
+    act_epsilon: float = 0.005,
+    act_max_batches: int = 4,
 ) -> None:
     """
     Full QLoRA fine-tuning pipeline with automated hyperparameter strategies:
@@ -102,7 +107,8 @@ def train(
     2. Load Laguna XS 2.1 with 4-bit NF4 quantization.
     3. Apply LoRA adapters — rank derived from hidden_dim, alpha = 2×rank.
     4. Find optimal LR via exponential sweep (find_learning_rate()).
-    5. Load training data; compute max_steps from dataset size at runtime.
+    5. ACT controller: feeds data in 50k batches, stops when val loss
+       improvement < epsilon (0.005); hard ceiling 4 batches (200k examples).
     6. Run SFTTrainer with auto_find_batch_size and EarlyStoppingCallback.
     7. Save the LoRA adapter to /outputs/final-adapter/.
     8. Commit the volume so the adapter persists after the container exits.
@@ -309,18 +315,22 @@ def train(
     print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
     # -----------------------------------------------------------------------
-    # 4. Load training data
+    # 4. ACT controller helpers
     # -----------------------------------------------------------------------
-    print(f"\nLoading training data from {DATA_PATH}...")
 
-    from datasets import load_dataset as hf_load_dataset
+    def load_jsonl(path: Path) -> list[dict]:
+        """Load a JSONL file into a list of dicts."""
+        records = []
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        return records
 
-    raw_ds = hf_load_dataset("json", data_files=str(DATA_PATH), split="train")
-    num_examples = len(raw_ds)
-    print(f"Loaded {num_examples:,} training examples.")
-
-    # ChatML formatting function.
-    # dataset_prep.py stores records as {"messages": [{role, content}, ...]}.
     def format_chatml(example: dict) -> dict:
         """Convert messages list to a single ChatML string."""
         messages = example.get("messages", [])
@@ -332,52 +342,209 @@ def train(
         parts.append("<|im_start|>assistant\n")   # open for generation
         return {"text": "\n".join(parts)}
 
-    # --limit: slice raw dataset first, then format (avoids formatting discarded records)
-    if limit is not None:
-        cap = min(limit, len(raw_ds))
-        raw_ds = raw_ds.select(range(cap))
-        print(f"[Smoke] --limit applied: using {cap:,} of {num_examples:,} examples.")
+    def train_on_batch(
+        model: object,
+        tokenizer: object,
+        batch_records: list[dict],
+        val_path_str: str,
+        cfg: dict,
+        output_dir: str,
+        max_steps_override: int = -1,
+    ) -> float:
+        """
+        Train SFTTrainer on a single batch of records; return best eval_loss.
 
-    # Pre-format so SFTTrainer can work with the "text" field.
-    formatted_ds = raw_ds.map(format_chatml, remove_columns=raw_ds.column_names)
-    print(f"Sample formatted example:\n{formatted_ds[0]['text'][:400]}...")
+        Returns float('inf') if training fails for any reason.
+        """
+        from datasets import Dataset as HFDataset
+        from transformers import EarlyStoppingCallback
+        from trl import SFTTrainer, SFTConfig
 
-    # Split off a small eval set for early stopping (5% or max 500 examples)
-    eval_size = min(500, max(1, int(len(formatted_ds) * 0.05)))
-    split = formatted_ds.train_test_split(test_size=eval_size, seed=42)
-    train_ds = split["train"]
-    eval_ds = split["test"]
-    print(f"Train set: {len(train_ds):,}  |  Eval set: {len(eval_ds):,}")
+        # Build HF Dataset from the batch records
+        batch_ds = HFDataset.from_list(batch_records)
+        formatted_batch = batch_ds.map(
+            format_chatml,
+            remove_columns=batch_ds.column_names,
+        )
 
-    # -----------------------------------------------------------------------
-    # 4a. Automated max_steps — derived from dataset size, not guessed.
-    #     effective_batch = per_device_batch × gradient_accumulation × n_gpus
-    #     max_steps = ceil(len(train_ds) / effective_batch) × max_epochs
-    # -----------------------------------------------------------------------
-    n_gpus = torch.cuda.device_count() or 1
-    effective_batch = (
-        cfg["per_device_train_batch_size"]
-        * cfg["gradient_accumulation_steps"]
-        * n_gpus
-    )
-    steps_per_epoch = math.ceil(len(train_ds) / effective_batch)
-    max_steps = steps_per_epoch * cfg["max_epochs"]
+        # Load fixed validation set (written by dataset_prep.py)
+        val_path = Path(val_path_str)
+        if val_path.exists():
+            val_records = load_jsonl(val_path)
+            val_ds_raw = HFDataset.from_list(val_records[:2000])  # cap at 2k for speed
+            eval_ds = val_ds_raw.map(format_chatml, remove_columns=val_ds_raw.column_names)
+        else:
+            # Fallback: carve 5% / max 500 from batch itself
+            eval_size = min(500, max(1, int(len(formatted_batch) * 0.05)))
+            split = formatted_batch.train_test_split(test_size=eval_size, seed=42)
+            formatted_batch = split["train"]
+            eval_ds = split["test"]
 
-    # --max-steps-override: override computed value for smoke testing
-    if max_steps_override > 0:
-        max_steps = max_steps_override
-        print(f"[Smoke] --max-steps override: {max_steps}")
+        train_ds = formatted_batch
+        print(f"  [batch] Train: {len(train_ds):,}  |  Eval: {len(eval_ds):,}")
 
-    print(f"\n[AutoHP] effective_batch : {effective_batch} "
-          f"(bs={cfg['per_device_train_batch_size']} × accum={cfg['gradient_accumulation_steps']} × gpus={n_gpus})")
-    print(f"[AutoHP] steps_per_epoch : {steps_per_epoch}")
-    print(f"[AutoHP] max_steps       : {max_steps}  ({cfg['max_epochs']} epochs × {steps_per_epoch} steps/epoch)")
+        # Derive max_steps for this batch
+        n_gpus = torch.cuda.device_count() or 1
+        effective_batch = (
+            cfg["per_device_train_batch_size"]
+            * cfg["gradient_accumulation_steps"]
+            * n_gpus
+        )
+        steps_per_epoch = math.ceil(len(train_ds) / effective_batch)
+        batch_max_steps = steps_per_epoch * cfg["max_epochs"]
+
+        if max_steps_override > 0:
+            batch_max_steps = max_steps_override
+            print(f"  [Smoke] --max-steps override: {batch_max_steps}")
+
+        print(f"  [batch] effective_batch={effective_batch}  steps/epoch={steps_per_epoch}  max_steps={batch_max_steps}")
+
+        sft_config = SFTConfig(
+            output_dir=output_dir,
+            max_steps=batch_max_steps,
+            num_train_epochs=cfg["max_epochs"],
+            per_device_train_batch_size=cfg["per_device_train_batch_size"],
+            auto_find_batch_size=cfg.get("auto_find_batch_size", True),
+            gradient_accumulation_steps=cfg["gradient_accumulation_steps"],
+            learning_rate=cfg.get("_act_learning_rate", cfg.get("learning_rate_fallback", 1e-4)),
+            lr_scheduler_type=cfg.get("lr_scheduler", "cosine_with_restarts"),
+            warmup_ratio=cfg.get("warmup_ratio", 0.03),
+            weight_decay=cfg.get("weight_decay", 0.01),
+            optim=cfg.get("optim", "adamw_8bit"),
+            fp16=cfg.get("fp16", False),
+            bf16=cfg.get("bf16", True),
+            gradient_checkpointing=cfg.get("gradient_checkpointing", True),
+            eval_strategy="steps",
+            eval_steps=cfg.get("eval_steps", 200),
+            load_best_model_at_end=cfg.get("load_best_model_at_end", True),
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            logging_steps=cfg.get("logging_steps", 50),
+            save_steps=cfg.get("eval_steps", 200),
+            save_total_limit=cfg.get("save_total_limit", 2),
+            report_to=cfg.get("report_to", "none"),
+            run_name=cfg.get("run_name", "laguna-xs-codealchemy"),
+            max_seq_length=cfg["max_seq_length"],
+            packing=cfg.get("packing", True),
+            dataset_text_field="text",
+        )
+
+        early_stopping = EarlyStoppingCallback(
+            early_stopping_patience=cfg.get("early_stopping_patience", 3),
+        )
+
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_ds,
+            eval_dataset=eval_ds,
+            args=sft_config,
+            callbacks=[early_stopping],
+        )
+
+        try:
+            trainer.train()
+            # Pull best eval_loss from trainer state
+            best_loss = getattr(trainer.state, "best_metric", None)
+            if best_loss is None:
+                # Fallback: run evaluate() directly
+                eval_out = trainer.evaluate()
+                best_loss = eval_out.get("eval_loss", float("inf"))
+            return float(best_loss)
+        except Exception as exc:
+            print(f"  [batch] Training failed: {exc}")
+            return float("inf")
+
+    def act_controller(
+        model: object,
+        tokenizer: object,
+        cfg: dict,
+        data_path: str,
+        val_path: str,
+        output_dir: str,
+        batch_size: int = 50_000,
+        epsilon: float = 0.005,
+        max_batches: int = 4,
+        max_steps_override: int = -1,
+    ) -> float:
+        """
+        ACT (Auto-Train Controller): feeds data in batches, stops when val loss
+        improvement drops below epsilon. Returns final best val loss.
+
+        Based on: ACT: Auto-Train for Code Translation Framework (2025)
+
+        Args:
+            model: LoRA-wrapped model.
+            tokenizer: Model tokenizer.
+            cfg: Training config dict.
+            data_path: Path to train.jsonl (full dataset).
+            val_path: Path to val.jsonl (fixed validation set).
+            output_dir: Directory for checkpoints.
+            batch_size: Number of examples per ACT batch.
+            epsilon: Minimum val loss improvement required to continue.
+            max_batches: Hard ceiling on number of batches (budget guard).
+            max_steps_override: Passed through to train_on_batch for smoke tests.
+
+        Returns:
+            Best validation loss achieved across all batches.
+        """
+        print(f"\n[ACT] Loading full dataset from {data_path}...")
+        all_records = load_jsonl(Path(data_path))
+        total = len(all_records)
+        print(f"[ACT] Total records: {total:,}  |  batch_size={batch_size:,}  |  max_batches={max_batches}  |  ε={epsilon}")
+
+        best_val_loss = float("inf")
+
+        for batch_idx in range(max_batches):
+            batch_start = batch_idx * batch_size
+            batch_end = min(batch_start + batch_size, total)
+            batch = all_records[batch_start:batch_end]
+
+            if not batch:
+                print(f"[ACT] No more data at batch {batch_idx}. Stopping.")
+                break
+
+            print(f"\n[ACT] Batch {batch_idx + 1}/{max_batches}: {len(batch):,} examples "
+                  f"(rows {batch_start:,}–{batch_end:,}; total seen: {batch_end:,})")
+
+            batch_val_loss = train_on_batch(
+                model,
+                tokenizer,
+                batch,
+                val_path,
+                cfg,
+                output_dir,
+                max_steps_override=max_steps_override,
+            )
+
+            improvement = best_val_loss - batch_val_loss
+            print(f"[ACT] Val loss: {batch_val_loss:.4f} | Best: {best_val_loss:.4f} "
+                  f"| Improvement: {improvement:.4f} | ε={epsilon}")
+
+            if batch_val_loss < best_val_loss:
+                best_val_loss = batch_val_loss
+
+            if batch_idx > 0 and improvement < epsilon:
+                print(f"[ACT] Improvement {improvement:.4f} < ε {epsilon}. "
+                      f"Data saturated. Stopping.")
+                break
+
+            if batch_end >= total:
+                print(f"[ACT] All {total:,} examples consumed. Stopping.")
+                break
+
+            print(f"[ACT] Still improving. Loading next batch...")
+
+        print(f"\n[ACT] Final best val loss: {best_val_loss:.4f}")
+        return best_val_loss
 
     # -----------------------------------------------------------------------
     # 4b. Automated LR finder — exponential sweep 1e-7 → 1e-2 over 100 steps.
     #     Returns the LR at the point of steepest loss descent (maximum
     #     negative gradient of smoothed loss).  Falls back to
     #     cfg["learning_rate_fallback"] if the sweep fails for any reason.
+    #     The found LR is stored in cfg["_act_learning_rate"] so train_on_batch
+    #     can use it across all ACT batches.
     # -----------------------------------------------------------------------
     def find_learning_rate(
         model: object,
@@ -503,14 +670,24 @@ def train(
             print(f"[LRFinder] Sweep failed ({exc}); using fallback LR {fallback_lr:.0e}")
             return fallback_lr
 
-    # Run the LR finder
+    # Run the LR finder against a small warm-up slice to find initial LR.
+    # We need at least a minimal dataset for the sweep — use a 200-record stub
+    # that is formatted as expected (list of dicts with "text" key).
+    _lr_stub_records = load_jsonl(DATA_PATH)[:200]
+    from datasets import Dataset as _HFDataset
+    _lr_stub_ds = _HFDataset.from_list(_lr_stub_records)
+    _lr_stub_formatted = _lr_stub_ds.map(format_chatml, remove_columns=_lr_stub_ds.column_names)
+
     learning_rate = find_learning_rate(
         model,
-        train_ds,
+        _lr_stub_formatted,
         tokenizer,
         fallback_lr=cfg.get("learning_rate_fallback", 1e-4),
     )
     print(f"[AutoHP] learning_rate  : {learning_rate:.2e}")
+
+    # Store found LR in cfg so train_on_batch (called inside act_controller) can use it
+    cfg["_act_learning_rate"] = learning_rate
 
     # -----------------------------------------------------------------------
     # 5. Set up W&B (if enabled)
@@ -520,78 +697,55 @@ def train(
         wandb.init(
             project=cfg.get("wandb_project", "laguna-codealchemy"),
             name=cfg.get("run_name", "laguna-xs-codealchemy"),
-            config={**cfg, "learning_rate": learning_rate, "max_steps": max_steps},
+            config={
+                **cfg,
+                "learning_rate": learning_rate,
+                "act_batch_size": act_batch_size,
+                "act_epsilon": act_epsilon,
+                "act_max_batches": act_max_batches,
+            },
         )
         print(f"W&B run: {wandb.run.url}")
 
     # -----------------------------------------------------------------------
-    # 6. Configure and run SFTTrainer with automated strategies
+    # 6. Run ACT controller (or single-pass if use_act=False)
     # -----------------------------------------------------------------------
-    from transformers import EarlyStoppingCallback
-    from trl import SFTTrainer, SFTConfig
+    VAL_PATH = "/data/val.jsonl"
 
-    print("\nStarting SFT training with automated hyperparameters...")
+    print("\nStarting ACT-controlled training...")
     t0 = time.time()
 
-    sft_config = SFTConfig(
-        output_dir=OUTPUT_DIR,
-        # Epochs & steps — max_steps derived from dataset size at runtime
-        max_steps=max_steps,
-        num_train_epochs=cfg["max_epochs"],   # upper bound; early stopping may end it sooner
-        # Batch size — auto_find_batch_size lets TRL double from 1 until OOM
-        per_device_train_batch_size=cfg["per_device_train_batch_size"],
-        auto_find_batch_size=cfg.get("auto_find_batch_size", True),
-        gradient_accumulation_steps=cfg["gradient_accumulation_steps"],
-        # LR — auto-found above; cosine_with_restarts scheduler
-        learning_rate=learning_rate,
-        lr_scheduler_type=cfg.get("lr_scheduler", "cosine_with_restarts"),
-        warmup_ratio=cfg.get("warmup_ratio", 0.03),
-        weight_decay=cfg.get("weight_decay", 0.01),
-        optim=cfg.get("optim", "adamw_8bit"),
-        # Precision
-        fp16=cfg.get("fp16", False),
-        bf16=cfg.get("bf16", True),
-        # Gradient checkpointing
-        gradient_checkpointing=cfg.get("gradient_checkpointing", True),
-        # Early stopping requires eval_strategy + load_best_model_at_end
-        eval_strategy="steps",
-        eval_steps=cfg.get("eval_steps", 200),
-        load_best_model_at_end=cfg.get("load_best_model_at_end", True),
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        # Logging & saving
-        logging_steps=cfg.get("logging_steps", 50),
-        save_steps=cfg.get("eval_steps", 200),   # save on every eval
-        save_total_limit=cfg.get("save_total_limit", 2),
-        report_to=cfg.get("report_to", "none"),
-        run_name=cfg.get("run_name", "laguna-xs-codealchemy"),
-        # SFT-specific
-        max_seq_length=cfg["max_seq_length"],
-        packing=cfg.get("packing", True),
-        dataset_text_field="text",
-    )
-
-    early_stopping = EarlyStoppingCallback(
-        early_stopping_patience=cfg.get("early_stopping_patience", 3),
-    )
-
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        args=sft_config,
-        callbacks=[early_stopping],
-    )
-
-    # Train
-    train_result = trainer.train()
+    if use_act:
+        print(f"[ACT] mode=ON  batch_size={act_batch_size:,}  epsilon={act_epsilon}  max_batches={act_max_batches}")
+        final_val_loss = act_controller(
+            model=model,
+            tokenizer=tokenizer,
+            cfg=cfg,
+            data_path=str(DATA_PATH),
+            val_path=VAL_PATH,
+            output_dir=OUTPUT_DIR,
+            batch_size=act_batch_size,
+            epsilon=act_epsilon,
+            max_batches=act_max_batches,
+            max_steps_override=max_steps_override,
+        )
+    else:
+        # Legacy single-pass: load everything, train once (for smoke/debug)
+        print("[ACT] mode=OFF — single-pass training on full dataset")
+        all_records = load_jsonl(DATA_PATH)
+        final_val_loss = train_on_batch(
+            model=model,
+            tokenizer=tokenizer,
+            batch_records=all_records,
+            val_path_str=VAL_PATH,
+            cfg=cfg,
+            output_dir=OUTPUT_DIR,
+            max_steps_override=max_steps_override,
+        )
 
     elapsed = time.time() - t0
     print(f"\nTraining finished in {elapsed/3600:.2f} h")
-    print(f"Final training loss : {train_result.training_loss:.4f}")
-    print(f"Total steps         : {train_result.global_step:,}")
-    print(f"Samples/sec         : {train_result.metrics.get('train_samples_per_second', 'N/A')}")
+    print(f"Final best val loss : {final_val_loss:.4f}")
 
     # -----------------------------------------------------------------------
     # 7. Save LoRA adapter
@@ -606,8 +760,7 @@ def train(
     summary = {
         "model_name": MODEL_NAME,
         "run_name": cfg.get("run_name", "laguna-xs-codealchemy"),
-        "final_loss": train_result.training_loss,
-        "global_step": train_result.global_step,
+        "final_val_loss": final_val_loss,
         "elapsed_hours": round(elapsed / 3600, 2),
         "gpu": "a100-40gb",
         "use_unsloth": USE_UNSLOTH,
@@ -617,12 +770,15 @@ def train(
         "learning_rate": learning_rate,
         "lr_auto_found": True,
         "max_epochs": cfg["max_epochs"],
-        "max_steps_computed": max_steps,
         "early_stopping_patience": cfg.get("early_stopping_patience", 3),
         "per_device_batch_size": cfg["per_device_train_batch_size"],
         "auto_find_batch_size": cfg.get("auto_find_batch_size", True),
         "gradient_accumulation_steps": cfg["gradient_accumulation_steps"],
-        "num_training_examples": num_examples,
+        # ACT controller parameters
+        "act_enabled": use_act,
+        "act_batch_size": act_batch_size,
+        "act_epsilon": act_epsilon,
+        "act_max_batches": act_max_batches,
     }
     summary_path = Path(FINAL_ADAPTER_DIR) / "training_summary.json"
     with summary_path.open("w") as f:
@@ -637,7 +793,7 @@ def train(
     # Finish W&B run
     if use_wandb:
         import wandb
-        wandb.log({"final_loss": train_result.training_loss})
+        wandb.log({"final_val_loss": final_val_loss})
         wandb.finish()
 
     print("\n=== Training complete ===")
@@ -649,35 +805,46 @@ def train(
 
 @app.local_entrypoint()
 def main(
-    limit: int = 0,
     max_steps: int = -1,
+    no_act: bool = False,
+    act_batch_size: int = 50_000,
+    act_epsilon: float = 0.005,
+    act_max_batches: int = 4,
 ) -> None:
     """
     Trigger the remote training job.
 
     Run with:
-        modal run train.py                          # blocks until done (prints logs live)
-        modal run train.py --detach                 # fire-and-forget (recommended for long runs)
-        modal run train.py --limit 500              # smoke test: cap at 500 examples
-        modal run train.py --max-steps 50           # smoke test: stop after 50 steps
-        modal run train.py --limit 500 --max-steps 50  # both together
+        modal run train.py                               # blocks until done (prints logs live)
+        modal run train.py --detach                      # fire-and-forget (recommended for long runs)
+        modal run train.py --max-steps 50                # smoke test: stop after 50 steps
+        modal run train.py --no-act                      # disable ACT; single-pass on full dataset
+        modal run train.py --act-max-batches 2           # limit to 2 batches (100k examples)
+        modal run train.py --act-epsilon 0.01            # larger epsilon = stops sooner
+
+    Data volume is governed by the ACT controller (epsilon=0.005, max 4 batches = 200k examples).
+    No --limit flag needed; the ACT batch ceiling replaces it.
 
     Retrieve the adapter after training:
         modal volume get laguna-codealchemy-vol /outputs/final-adapter ./final-adapter
     """
-    if limit > 0 and limit < 2:
-        raise SystemExit("--limit must be >= 2")
     print("Submitting training job to Modal...")
     print("  GPU     : A100 40 GB")
     print("  Timeout : 7 hours")
     print("  Volume  : laguna-codealchemy-vol")
     print("  Output  : /outputs/final-adapter/")
-    if limit > 0:
-        print(f"  [Smoke] limit      : {limit} examples")
+    print(f"  ACT     : {'OFF (single-pass)' if no_act else 'ON'}")
+    if not no_act:
+        print(f"  ACT batch size  : {act_batch_size:,}")
+        print(f"  ACT epsilon     : {act_epsilon}")
+        print(f"  ACT max batches : {act_max_batches}  (max {act_batch_size * act_max_batches:,} examples)")
     if max_steps > 0:
         print(f"  [Smoke] max-steps  : {max_steps}")
     print()
     train.remote(
-        limit=limit if limit > 0 else None,
         max_steps_override=max_steps,
+        use_act=not no_act,
+        act_batch_size=act_batch_size,
+        act_epsilon=act_epsilon,
+        act_max_batches=act_max_batches,
     )

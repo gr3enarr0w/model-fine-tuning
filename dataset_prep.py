@@ -2,11 +2,16 @@
 """
 dataset_prep.py — Laguna XS 2.1 QLoRA fine-tuning data preparation.
 
-Downloads and prepares ~200k training examples via streaming (no OOM):
-  - ~100k from open-alchemy/code-alchemy (weighted by type)
-  - ~100k from WaltonFuture/agentic-sft-new
+Downloads and prepares the full available training data via streaming (no OOM):
+  - All available examples from open-alchemy/code-alchemy (weighted by type)
+  - All available examples from WaltonFuture/agentic-sft-new
 
-Output: data/train.jsonl, data/eval.jsonl (90/10 split)
+The ACT controller in train.py / train_gemma.py decides when to stop consuming
+data — dataset_prep.py streams everything it can find and writes it all out.
+The 200k cap is gone; ACT's batch ceiling (max_batches=4, batch_size=50k)
+provides the budget guard at training time, not at data-prep time.
+
+Output: data/train.jsonl, data/val.jsonl, data/test.jsonl (80/10/10 split)
 Format: ChatML JSONL
 """
 
@@ -35,14 +40,18 @@ AGENTIC_DATASET = "WaltonFuture/agentic-sft-new"
 
 # Bug fix #1: Config names must be hyphenated lowercase (not PascalCase).
 # Correct configs: code-dev, code-dialogue, code-trace, code-enhance, code-qa
+#
+# No artificial caps — stream the full available data from each config.
+# Use sys.maxsize as the target so the streaming loop exhausts the source.
+# The ACT controller in train.py / train_gemma.py is the budget gate.
 CODEALCHEMY_TARGETS: dict[str, int] = {
-    "code-dev": 40_000,
-    "code-dialogue": 30_000,
-    "code-trace": 20_000,
-    "code-enhance": 5_000,
-    "code-qa": 5_000,
+    "code-dev":      sys.maxsize,
+    "code-dialogue": sys.maxsize,
+    "code-trace":    sys.maxsize,
+    "code-enhance":  sys.maxsize,
+    "code-qa":       sys.maxsize,
 }
-CODEALCHEMY_TOTAL = sum(CODEALCHEMY_TARGETS.values())  # 100_000
+CODEALCHEMY_TOTAL = sys.maxsize  # effectively unlimited; ACT controls training volume
 
 # Bug fix #5: Synthetic user prompts per config (text is already formatted).
 # The full text/text_with_placeholders becomes the assistant turn.
@@ -58,12 +67,16 @@ CODEALCHEMY_USER_PROMPTS: dict[str, str] = {
 CODEALCHEMY_PLACEHOLDER_CONFIGS = {"code-dev", "code-dialogue"}
 CODEALCHEMY_TEXT_CONFIGS = {"code-trace", "code-enhance", "code-qa"}
 
-AGENTIC_TOTAL = 100_000
+# No artificial cap — stream everything available (~711k examples).
+# ACT controller decides when to stop consuming data at training time.
+AGENTIC_TOTAL = sys.maxsize
 
 # Bug fix #4: Expand language filter to include common variants
 ALLOWED_LANGUAGES = {"python", "go", "typescript", "java", "javascript", "js", "ts", "py"}
 
-TRAIN_RATIO = 0.90
+TRAIN_RATIO = 0.80
+VAL_RATIO   = 0.10
+# TEST_RATIO implicit: 0.10 — held out completely, never used during training
 SEED = 42
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -359,14 +372,14 @@ def main() -> None:
     random.seed(SEED)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Apply --limit to reduce targets for smoke testing
+    # Apply --limit to reduce targets for smoke testing.
+    # Without --limit, stream everything available (ACT controls training volume).
     if args.limit:
         print(f"[SMOKE TEST] Limiting total examples to {args.limit}")
-        total_ca_target = CODEALCHEMY_TOTAL  # 100_000
-        targets = {
-            k: round(args.limit * (v / (total_ca_target + AGENTIC_TOTAL)))
-            for k, v in CODEALCHEMY_TARGETS.items()
-        }
+        # Split half to CodeAlchemy, half to Agentic, distribute CA evenly across configs.
+        ca_limit = args.limit // 2
+        per_config_limit = max(2, ca_limit // len(CODEALCHEMY_TARGETS))
+        targets = {k: per_config_limit for k in CODEALCHEMY_TARGETS}
         agentic_limit = args.limit - sum(targets.values())
         agentic_limit = max(0, agentic_limit)
     else:
@@ -416,21 +429,29 @@ def main() -> None:
     print("Shuffling...")
     random.shuffle(all_records)
 
-    split_idx = int(len(all_records) * TRAIN_RATIO)
-    train_records = all_records[:split_idx]
-    eval_records = all_records[split_idx:]
+    total = len(all_records)
+    train_end = int(total * TRAIN_RATIO)
+    val_end   = int(total * (TRAIN_RATIO + VAL_RATIO))
+
+    train_records = all_records[:train_end]
+    val_records   = all_records[train_end:val_end]
+    test_records  = all_records[val_end:]
 
     # ------------------------------------------------------------------
     # 4. Write output
     # ------------------------------------------------------------------
     train_path = DATA_DIR / "train.jsonl"
-    eval_path = DATA_DIR / "eval.jsonl"
+    val_path   = DATA_DIR / "val.jsonl"
+    test_path  = DATA_DIR / "test.jsonl"
 
     print(f"Writing {len(train_records):,} train examples to {train_path}...")
     write_jsonl(train_path, train_records)
 
-    print(f"Writing {len(eval_records):,} eval examples to {eval_path}...")
-    write_jsonl(eval_path, eval_records)
+    print(f"Writing {len(val_records):,} val examples to {val_path}...")
+    write_jsonl(val_path, val_records)
+
+    print(f"Writing {len(test_records):,} test examples to {test_path} (held out)...")
+    write_jsonl(test_path, test_records)
 
     # ------------------------------------------------------------------
     # 5. Stats
@@ -448,7 +469,8 @@ def main() -> None:
 
     print(f"\nTotal examples : {total_examples:,}")
     print(f"  Train        : {len(train_records):,}")
-    print(f"  Eval         : {len(eval_records):,}")
+    print(f"  Val          : {len(val_records):,}")
+    print(f"  Test         : {len(test_records):,}")
     print(f"Estimated tokens (chars/4): ~{estimated_tokens:,}")
 
     print("\n--- CodeAlchemy by type ---")
@@ -472,8 +494,9 @@ def main() -> None:
 
     print("\n--- Output files ---")
     print(f"  Train: {train_path}  ({train_path.stat().st_size / 1e6:.1f} MB)")
-    print(f"  Eval:  {eval_path}  ({eval_path.stat().st_size / 1e6:.1f} MB)")
-    print("\nDone.")
+    print(f"  Val:   {val_path}  ({val_path.stat().st_size / 1e6:.1f} MB)")
+    print(f"  Test:  {test_path}  ({test_path.stat().st_size / 1e6:.1f} MB)")
+    print("\nDone. ACT controller in train.py will decide how much of train.jsonl to consume.")
 
 
 if __name__ == "__main__":
