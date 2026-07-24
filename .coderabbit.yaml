@@ -1,0 +1,26 @@
+version: "2"
+language: "en-US"
+reviews:
+  profile: "assertive"
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!data/**"
+    - "!outputs/**"
+    - "!__pycache__/**"
+  path_instructions:
+    - path: "dataset_prep.py"
+      instructions: "Focus on: correct HuggingFace dataset field names, streaming correctness, memory efficiency, deduplication logic"
+    - path: "train.py"
+      instructions: "Focus on: Modal GPU config, QLoRA correctness, memory usage, checkpoint saving"
+    - path: "serve.py"
+      instructions: "Focus on: vLLM MoE compatibility, OpenAI API schema compliance, streaming correctness"
+    - path: "configs/*.yaml"
+      instructions: "Focus on: LoRA hyperparameter correctness for 33B MoE models"
+chat:
+  auto_reply: true
