@@ -86,13 +86,13 @@ image = (
     gpu="a100-40gb",
     timeout=14 * 3600,         # 14-hour hard cap (was 7h; HF streaming runs longer)
     volumes={
-        "/data": volume,
-        "/outputs": volume,
+        "/outputs": volume,   # persist LoRA adapter; /data not needed (data streamed from HF)
     },
     image=image,
     secrets=[
         modal.Secret.from_name("huggingface-token"),
-        modal.Secret.from_name("wandb-token", required=False),  # optional
+        # wandb-token omitted — create it if you want W&B logging:
+        #   modal secret create wandb-token WANDB_API_KEY=...
     ],
     memory=65536,              # 64 GB RAM to handle tokenization buffers
 )
