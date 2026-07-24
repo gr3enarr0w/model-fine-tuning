@@ -33,19 +33,35 @@ SYSTEM_PROMPT = (
 CODEALCHEMY_DATASET = "open-alchemy/code-alchemy"
 AGENTIC_DATASET = "WaltonFuture/agentic-sft-new"
 
-# Weighted targets from CodeAlchemy
+# Bug fix #1: Config names must be hyphenated lowercase (not PascalCase).
+# Correct configs: code-dev, code-dialogue, code-trace, code-enhance, code-qa
 CODEALCHEMY_TARGETS: dict[str, int] = {
-    "CodeDev": 40_000,
-    "CodeDialogue": 30_000,
-    "CodeTrace": 20_000,
-    "CodeEnhance": 5_000,
-    "CodeQA": 5_000,
+    "code-dev": 40_000,
+    "code-dialogue": 30_000,
+    "code-trace": 20_000,
+    "code-enhance": 5_000,
+    "code-qa": 5_000,
 }
 CODEALCHEMY_TOTAL = sum(CODEALCHEMY_TARGETS.values())  # 100_000
 
+# Bug fix #5: Synthetic user prompts per config (text is already formatted).
+# The full text/text_with_placeholders becomes the assistant turn.
+CODEALCHEMY_USER_PROMPTS: dict[str, str] = {
+    "code-dev": "Complete the following developer task:",
+    "code-dialogue": "Continue this development conversation:",
+    "code-trace": "Analyze this code execution trace:",
+    "code-enhance": "Review and improve this code:",
+    "code-qa": "Answer this code question:",
+}
+
+# Bug fix #2: text_with_placeholders configs vs text configs
+CODEALCHEMY_PLACEHOLDER_CONFIGS = {"code-dev", "code-dialogue"}
+CODEALCHEMY_TEXT_CONFIGS = {"code-trace", "code-enhance", "code-qa"}
+
 AGENTIC_TOTAL = 100_000
 
-ALLOWED_LANGUAGES = {"python", "go", "typescript", "java"}
+# Bug fix #4: Expand language filter to include common variants
+ALLOWED_LANGUAGES = {"python", "go", "typescript", "java", "javascript", "js", "ts", "py"}
 
 TRAIN_RATIO = 0.90
 SEED = 42
@@ -99,57 +115,41 @@ def _get_language(example: dict) -> str | None:
     return lang.lower().strip() if lang else None
 
 
-def _extract_codealchemy_text(example: dict) -> tuple[str, str] | None:
+def _extract_codealchemy_text(example: dict, config_name: str) -> tuple[str, str] | None:
     """
     Return (user_turn, assistant_turn) from a CodeAlchemy example.
+
+    Bug fix #2: Use the correct field per config:
+      - code-dev, code-dialogue: text_with_placeholders
+      - code-trace, code-enhance, code-qa: text
+
+    Bug fix #5: The text is already formatted — treat the full text as the
+    assistant turn and synthesize a generic user instruction from the config.
+
     Returns None if content cannot be extracted.
     """
-    # Try conversation-style fields first
-    messages = example.get("messages") or example.get("conversations")
-    if messages and isinstance(messages, list):
-        # Filter to user/assistant pairs
-        user_parts: list[str] = []
-        assistant_parts: list[str] = []
-        for msg in messages:
-            role = (msg.get("role") or msg.get("from") or "").lower()
-            content = msg.get("content") or msg.get("value") or ""
-            if role in ("user", "human"):
-                user_parts.append(str(content).strip())
-            elif role in ("assistant", "gpt", "model"):
-                assistant_parts.append(str(content).strip())
-        user = "\n\n".join(filter(None, user_parts))
-        assistant = "\n\n".join(filter(None, assistant_parts))
-        if user and assistant:
-            return user, assistant
+    # Bug fix #2: select the correct field based on config
+    if config_name in CODEALCHEMY_PLACEHOLDER_CONFIGS:
+        raw_text = example.get("text_with_placeholders", "")
+    else:
+        raw_text = example.get("text", "")
 
-    # Flat instruction/output style
-    instruction = (
-        example.get("instruction")
-        or example.get("input")
-        or example.get("prompt")
-        or example.get("question")
-        or ""
-    )
-    output = (
-        example.get("output")
-        or example.get("response")
-        or example.get("answer")
-        or example.get("completion")
-        or ""
-    )
-    instruction = str(instruction).strip()
-    output = str(output).strip()
-    if instruction and output:
-        return instruction, output
+    raw_text = str(raw_text).strip() if raw_text else ""
+    if not raw_text:
+        return None
 
-    return None
+    # Bug fix #5: synthesize user turn from config-specific prompt
+    user_turn = CODEALCHEMY_USER_PROMPTS.get(config_name, "Complete the following coding task:")
+    assistant_turn = raw_text
+
+    return user_turn, assistant_turn
 
 
 def stream_codealchemy(targets: dict[str, int]) -> Iterator[tuple[dict, str, str]]:
     """
     Yields (chatml_record, type_label, language) for CodeAlchemy examples.
 
-    Streams each subset type independently and takes up to target count,
+    Streams each subset config independently and takes up to target count,
     filtering to allowed languages.
     """
     try:
@@ -167,56 +167,37 @@ def stream_codealchemy(targets: dict[str, int]) -> Iterator[tuple[dict, str, str
 
     seen_hashes: set[str] = set()
 
-    for type_label, target_count in targets.items():
-        print(f"\n[CodeAlchemy] Streaming {type_label} (target: {target_count:,})...")
+    for config_name, target_count in targets.items():
+        print(f"\n[CodeAlchemy] Streaming {config_name} (target: {target_count:,})...")
 
-        # Try loading with a config/split that matches the type label.
-        # The dataset may expose types as configs, splits, or a 'type' column.
-        # We try multiple strategies gracefully.
+        # Bug fix #1: use the hyphenated config name directly.
+        # Bug fix #3: do NOT pass trust_remote_code=True.
         ds = None
-
-        # Strategy 1: type_label as config name
         try:
             ds = load_dataset(
                 CODEALCHEMY_DATASET,
-                name=type_label,
+                name=config_name,
                 split="train",
                 streaming=True,
-                trust_remote_code=True,
             )
-        except Exception:
-            pass
-
-        # Strategy 2: flat dataset, filter by 'type' column client-side
-        if ds is None:
-            try:
-                ds = load_dataset(
-                    CODEALCHEMY_DATASET,
-                    split="train",
-                    streaming=True,
-                    trust_remote_code=True,
-                )
-                ds = ds.filter(
-                    lambda ex: (ex.get("type") or ex.get("task_type") or "").strip() == type_label
-                )
-            except Exception as exc:
-                print(f"  WARNING: could not load {type_label}: {exc}", file=sys.stderr)
-                continue
+        except Exception as exc:
+            print(f"  WARNING: could not load config {config_name}: {exc}", file=sys.stderr)
+            continue
 
         collected = 0
-        bar = tqdm(total=target_count, desc=type_label, unit="ex")
+        bar = tqdm(total=target_count, desc=config_name, unit="ex")
 
         for example in ds:
             if collected >= target_count:
                 break
 
-            # Language filter
+            # Language filter (bug fix #4: expanded set)
             lang = _get_language(example)
             if lang not in ALLOWED_LANGUAGES:
                 continue
 
-            # Extract text
-            pair = _extract_codealchemy_text(example)
+            # Extract text (bug fix #2 + #5)
+            pair = _extract_codealchemy_text(example, config_name)
             if pair is None:
                 continue
             user_text, asst_text = pair
@@ -225,19 +206,19 @@ def stream_codealchemy(targets: dict[str, int]) -> Iterator[tuple[dict, str, str
             if not user_text.strip() or not asst_text.strip():
                 continue
 
-            # Dedup
-            h = content_hash(user_text + asst_text)
+            # Dedup on assistant content (user is synthetic/identical per config)
+            h = content_hash(asst_text)
             if h in seen_hashes:
                 continue
             seen_hashes.add(h)
 
             record = chatml_record(user_text, asst_text)
-            yield record, type_label, lang
+            yield record, config_name, lang
             collected += 1
             bar.update(1)
 
         bar.close()
-        print(f"  Collected {collected:,} from {type_label}")
+        print(f"  Collected {collected:,} from {config_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -309,11 +290,11 @@ def stream_agentic(target_count: int) -> Iterator[dict]:
     FETCH_FACTOR = 1.3
     fetch_count = int(target_count * FETCH_FACTOR)
 
+    # Bug fix #3: do NOT pass trust_remote_code=True.
     ds = load_dataset(
         AGENTIC_DATASET,
         split="train",
         streaming=True,
-        trust_remote_code=True,
     ).take(fetch_count)
 
     seen_hashes: set[str] = set()
