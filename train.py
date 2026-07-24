@@ -58,10 +58,10 @@ image = (
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
-        # transformers pinned below 4.51 to avoid the strict YaRN RoPE validation
-        # introduced in 4.51 that crashes on poolside/Laguna-XS-2.1's config
-        # (KeyError: 'original_max_position_embeddings').
-        "transformers>=4.45.0,<4.51.0",
+        # Note: transformers version is largely controlled by Unsloth's own pinning.
+        # The strict YaRN RoPE validation (KeyError: 'original_max_position_embeddings')
+        # is handled in the fallback path below via the AutoConfig patch.
+        "transformers>=4.45.0",
         "accelerate>=0.34.0",
         "peft>=0.13.0",
         "bitsandbytes>=0.44.0",
@@ -275,27 +275,41 @@ def train(
             bnb_4bit_compute_dtype=getattr(torch, cfg["bnb_4bit_compute_dtype"]),
         )
 
-        # Load the model config first so we can patch the rope_scaling dict if
-        # it's a YaRN config that's missing 'original_max_position_embeddings'.
-        # This avoids a KeyError introduced by strict RoPE validation in newer
-        # transformers versions (>= 4.51).
+        # Monkey-patch the YaRN RoPE validator that was tightened in transformers >=4.51.
+        # poolside/Laguna-XS-2.1 ships a rope_scaling dict of type "yarn" that is
+        # missing 'original_max_position_embeddings', which causes a KeyError inside
+        # _validate_yarn_rope_parameters.  We wrap the validator to inject the missing
+        # key from max_position_embeddings before delegating to the original function.
+        try:
+            import transformers.modeling_rope_utils as _rope_utils
+
+            _orig_validate_yarn = _rope_utils._validate_yarn_rope_parameters
+
+            def _patched_validate_yarn(config, **kwargs):
+                rope = getattr(config, "rope_scaling", None) or {}
+                if (
+                    isinstance(rope, dict)
+                    and "original_max_position_embeddings" not in rope
+                    and hasattr(config, "max_position_embeddings")
+                ):
+                    print(
+                        "[rope_patch] Injecting missing "
+                        "'original_max_position_embeddings' into YaRN rope_scaling "
+                        f"(value={config.max_position_embeddings})."
+                    )
+                    rope["original_max_position_embeddings"] = config.max_position_embeddings
+                return _orig_validate_yarn(config, **kwargs)
+
+            _rope_utils._validate_yarn_rope_parameters = _patched_validate_yarn
+            print("[rope_patch] YaRN RoPE validator patched successfully.")
+        except Exception as patch_err:
+            print(f"[rope_patch] Could not patch YaRN validator ({patch_err}); proceeding anyway.")
+
+        # Load config first (with trust_remote_code) so we can also pass it
+        # directly to from_pretrained and avoid a second remote fetch.
         hf_config = AutoConfig.from_pretrained(
             MODEL_NAME, token=hf_token, trust_remote_code=True
         )
-        if (
-            hasattr(hf_config, "rope_scaling")
-            and isinstance(hf_config.rope_scaling, dict)
-            and hf_config.rope_scaling.get("type") in ("yarn", "dynamic-yarn")
-            and "original_max_position_embeddings" not in hf_config.rope_scaling
-        ):
-            print(
-                "[rope_patch] YaRN rope_scaling missing "
-                "'original_max_position_embeddings'; injecting default "
-                f"(= max_position_embeddings={hf_config.max_position_embeddings})."
-            )
-            hf_config.rope_scaling["original_max_position_embeddings"] = (
-                hf_config.max_position_embeddings
-            )
 
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=hf_token, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
