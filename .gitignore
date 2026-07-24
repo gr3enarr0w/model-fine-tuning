@@ -1,0 +1,9 @@
+data/*.jsonl
+data/*.parquet
+outputs/
+*.bin
+*.safetensors
+__pycache__/
+*.pyc
+.env
+wandb/
