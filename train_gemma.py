@@ -5,11 +5,16 @@ Two training strategies:
   Strategy A: per-language specialization (one adapter per language)
   Strategy B: generalist (single adapter, all languages)
 
-Run locally on M2 Pro or on Modal for faster iteration.
+Run locally on M2 Pro or on Modal A10G for faster iteration.
 
-Usage:
+Usage (local):
   python train_gemma.py --strategy per-language --language python
   python train_gemma.py --strategy generalist
+
+Usage (Modal — A10G at ~$1.10/hr):
+  modal run train_gemma.py --language python
+  modal run train_gemma.py --language python --max-steps 50   # smoke test
+  modal run train_gemma.py                                    # generalist
 
 Automated hyperparameter strategies
 ------------------------------------
@@ -26,7 +31,503 @@ import math
 import os
 from pathlib import Path
 
+import modal
 import yaml
+
+# ---------------------------------------------------------------------------
+# Modal app & shared resources
+# ---------------------------------------------------------------------------
+
+app = modal.App("gemma-e4b-codealchemy")
+
+# Persistent volume — stores training data and output adapters.
+# /data    → per-language JSONL files (train_python.jsonl, etc.) + train.jsonl
+# /outputs → LoRA adapters saved after each language run
+volume = modal.Volume.from_name("model-fine-tuning-vol", create_if_missing=True)
+
+# Container image with all training dependencies.
+# A10G supports BF16 natively; Unsloth with cu121-ampere wheels works well.
+gemma_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "torch==2.4.1",
+        "torchvision",
+        "torchaudio",
+        extra_index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
+        "transformers>=4.45.0",
+        "accelerate>=0.34.0",
+        "peft>=0.13.0",
+        "bitsandbytes>=0.44.0",
+        "datasets>=3.0.0",
+        "trl>=0.11.0",
+        "sentencepiece",
+        "protobuf",
+        "pyyaml",
+        "tqdm",
+    )
+    .pip_install(
+        # Unsloth last — auto-detects torch/CUDA and compiles kernels
+        "unsloth[cu121-ampere-torch240] @ https://github.com/unslothai/unsloth/archive/refs/heads/main.zip",
+    )
+)
+
+# ---------------------------------------------------------------------------
+# Modal training function — A10G (~$1.10/hr; sufficient for 4B param model)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    gpu="a10g",
+    timeout=4 * 3600,          # 4-hour hard cap per language
+    volumes={
+        "/data": volume,
+        "/outputs": volume,
+    },
+    image=gemma_image,
+    secrets=[
+        modal.Secret.from_name("huggingface-token"),
+    ],
+    memory=32768,              # 32 GB RAM; E4B is 4B params, fits comfortably
+)
+def train_modal(
+    language: str | None = None,
+    strategy: str = "per-language",
+    limit: int | None = None,
+    max_steps_override: int = -1,
+) -> None:
+    """
+    QLoRA fine-tuning of Gemma 4 E4B on CodeAlchemy data — runs on Modal A10G.
+
+    Args:
+        language: Target language for per-language strategy (e.g. "python").
+                  None triggers generalist training.
+        strategy: "per-language" or "generalist".
+        limit: Cap total training examples for smoke testing.
+        max_steps_override: Override computed max_steps for smoke testing.
+
+    Saves adapter to /outputs/gemma-e4b-{language}/ or
+    /outputs/gemma-e4b-generalist/ on the Modal volume.
+    """
+    import json
+    import math
+    import os
+    import time
+    from pathlib import Path as _Path
+
+    import torch
+    import yaml as _yaml
+
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token:
+        raise EnvironmentError(
+            "HF_TOKEN not set. Create the Modal secret:\n"
+            "  modal secret create huggingface-token HF_TOKEN=hf_..."
+        )
+
+    # Resolve strategy from language argument
+    if language is None:
+        strategy = "generalist"
+    else:
+        strategy = "per-language"
+
+    # -----------------------------------------------------------------------
+    # Paths
+    # -----------------------------------------------------------------------
+    if strategy == "per-language":
+        data_path = _Path(f"/data/train_{language}.jsonl")
+        output_tag = f"gemma-e4b-{language}"
+    else:
+        data_path = _Path("/data/train.jsonl")
+        output_tag = "gemma-e4b-generalist"
+
+    output_path = _Path("/outputs") / output_tag
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    print(f"Strategy  : {strategy}")
+    print(f"Language  : {language or 'all (generalist)'}")
+    print(f"Data      : {data_path}")
+    print(f"Output    : {output_path}")
+
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"Training data not found at {data_path}.\n"
+            "Upload it first:\n"
+            f"  modal volume put model-fine-tuning-vol data/train_{language}.jsonl /data/train_{language}.jsonl"
+        )
+
+    # -----------------------------------------------------------------------
+    # Config defaults (mirrors configs/lora_gemma.yaml)
+    # -----------------------------------------------------------------------
+    DEFAULTS: dict = {
+        "model_name": "google/gemma-4-e4b-it",
+        "max_seq_length": 4096,
+        "load_in_4bit": False,    # E4B fits in BF16 on A10G without quantization
+        "lora_r": 16,             # overridden below by hidden_dim formula
+        "lora_alpha": 32,
+        "lora_dropout": 0.05,
+        "lora_target_modules": ["q_proj", "v_proj", "k_proj", "o_proj",
+                                 "gate_proj", "up_proj", "down_proj"],
+        "per_device_train_batch_size": 4,
+        "auto_find_batch_size": True,
+        "gradient_accumulation_steps": 4,
+        "max_epochs": 5,
+        "early_stopping_patience": 3,
+        "eval_steps": 100,
+        "load_best_model_at_end": True,
+        "warmup_ratio": 0.03,
+        "learning_rate_fallback": 1e-4,
+        "lr_scheduler": "cosine_with_restarts",
+        "weight_decay": 0.01,
+        "save_total_limit": 2,
+        "fp16": False,
+        "bf16": True,
+        "gradient_checkpointing": True,
+        "packing": True,
+    }
+    cfg = DEFAULTS.copy()
+
+    # -----------------------------------------------------------------------
+    # Automated LoRA rank — Gemma 4 E4B hidden_dim=2048 → r=16, alpha=32
+    # -----------------------------------------------------------------------
+    lora_r = max(8, HIDDEN_DIM_GEMMA_E4B // 128)   # = 16
+    lora_alpha = 2 * lora_r                         # = 32
+    cfg["lora_r"] = lora_r
+    cfg["lora_alpha"] = lora_alpha
+    print(f"\n[AutoHP] LoRA rank  : {lora_r}  (hidden_dim={HIDDEN_DIM_GEMMA_E4B} // 128)")
+    print(f"[AutoHP] LoRA alpha : {lora_alpha}  (2 × rank)")
+
+    # -----------------------------------------------------------------------
+    # Load model
+    # -----------------------------------------------------------------------
+    MODEL_NAME = cfg["model_name"]
+    print(f"\nLoading {MODEL_NAME}...")
+
+    try:
+        from unsloth import FastLanguageModel
+
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=MODEL_NAME,
+            max_seq_length=cfg["max_seq_length"],
+            load_in_4bit=cfg["load_in_4bit"],
+            dtype=None,
+            token=hf_token,
+        )
+        USE_UNSLOTH = True
+        print("Unsloth loaded successfully.")
+
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=cfg["lora_r"],
+            lora_alpha=cfg["lora_alpha"],
+            lora_dropout=cfg["lora_dropout"],
+            target_modules=cfg["lora_target_modules"],
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=42,
+        )
+
+    except Exception as exc:
+        print(f"Unsloth not available ({exc}); using HuggingFace PEFT...")
+        USE_UNSLOTH = False
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import LoraConfig, get_peft_model
+
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=hf_token)
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            token=hf_token,
+        )
+
+        lora_config = LoraConfig(
+            r=cfg["lora_r"],
+            lora_alpha=cfg["lora_alpha"],
+            lora_dropout=cfg["lora_dropout"],
+            target_modules=cfg["lora_target_modules"],
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+
+    # -----------------------------------------------------------------------
+    # Load and format dataset
+    # -----------------------------------------------------------------------
+    from datasets import load_dataset as hf_load_dataset
+
+    print(f"\nLoading training data from {data_path}...")
+    raw_ds = hf_load_dataset("json", data_files=str(data_path), split="train")
+    num_examples = len(raw_ds)
+    print(f"Loaded {num_examples:,} examples.")
+
+    def format_chatml(example: dict) -> dict:
+        """Convert messages list to a single ChatML string."""
+        messages = example.get("messages", [])
+        parts: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+        parts.append("<|im_start|>assistant\n")
+        return {"text": "\n".join(parts)}
+
+    formatted_ds = raw_ds.map(format_chatml, remove_columns=raw_ds.column_names)
+
+    if limit is not None:
+        cap = min(limit, len(formatted_ds))
+        formatted_ds = formatted_ds.select(range(cap))
+        print(f"[Smoke] --limit applied: using {cap:,} of {num_examples:,} examples.")
+
+    eval_size = min(500, max(1, int(len(formatted_ds) * 0.05)))
+    split = formatted_ds.train_test_split(test_size=eval_size, seed=42)
+    train_ds = split["train"]
+    eval_ds = split["test"]
+    print(f"Train set: {len(train_ds):,}  |  Eval set: {len(eval_ds):,}")
+
+    # -----------------------------------------------------------------------
+    # Automated max_steps
+    # -----------------------------------------------------------------------
+    n_gpus = torch.cuda.device_count() or 1
+    effective_batch = (
+        cfg["per_device_train_batch_size"]
+        * cfg["gradient_accumulation_steps"]
+        * n_gpus
+    )
+    steps_per_epoch = math.ceil(len(train_ds) / effective_batch)
+    max_steps = steps_per_epoch * cfg["max_epochs"]
+
+    if max_steps_override > 0:
+        max_steps = max_steps_override
+        print(f"[Smoke] --max-steps override: {max_steps}")
+
+    print(f"\n[AutoHP] effective_batch : {effective_batch}")
+    print(f"[AutoHP] steps_per_epoch : {steps_per_epoch}")
+    print(f"[AutoHP] max_steps       : {max_steps}")
+
+    # -----------------------------------------------------------------------
+    # Automated LR finder
+    # -----------------------------------------------------------------------
+    def _find_lr(model, train_ds, tokenizer, fallback_lr=1e-4):
+        """Exponential LR sweep; returns optimal LR or fallback on failure."""
+        import copy
+
+        print(f"\n[LRFinder] Sweeping LR 1e-7 → 1e-2 over 100 steps...")
+        try:
+            from torch.optim import AdamW
+
+            sweep_model = copy.deepcopy(model)
+            sweep_model.train()
+            optimizer = AdamW(sweep_model.parameters(), lr=1e-7)
+
+            try:
+                device = next(sweep_model.parameters()).device
+            except StopIteration:
+                device = "cuda"
+
+            sweep_texts = [train_ds[i]["text"] for i in range(min(200, len(train_ds)))]
+            encodings = tokenizer(
+                sweep_texts, truncation=True, max_length=256,
+                padding="max_length", return_tensors="pt",
+            )
+            input_ids = encodings["input_ids"].to(device)
+            attention_mask = encodings["attention_mask"].to(device)
+
+            lr_multiplier = (1e-2 / 1e-7) ** (1.0 / 100)
+            losses: list[float] = []
+            lrs: list[float] = []
+            current_lr = 1e-7
+
+            for step in range(100):
+                for pg in optimizer.param_groups:
+                    pg["lr"] = current_lr
+                idx = step % len(input_ids)
+                optimizer.zero_grad()
+                outputs = sweep_model(
+                    input_ids=input_ids[idx:idx+1],
+                    attention_mask=attention_mask[idx:idx+1],
+                    labels=input_ids[idx:idx+1],
+                )
+                outputs.loss.backward()
+                optimizer.step()
+                losses.append(outputs.loss.item())
+                lrs.append(current_lr)
+                current_lr *= lr_multiplier
+                if outputs.loss.item() > 10 * losses[0]:
+                    break
+
+            beta, avg, smoothed = 0.9, losses[0], []
+            for l in losses:
+                avg = beta * avg + (1 - beta) * l
+                smoothed.append(avg / (1 - beta ** (len(smoothed) + 1)))
+
+            if len(smoothed) < 3:
+                raise ValueError("Too few steps")
+
+            gradients = [smoothed[i+1] - smoothed[i] for i in range(len(smoothed) - 1)]
+            best_idx = gradients.index(min(gradients))
+            suggested_lr = float(min(max(lrs[max(0, best_idx - 1)], 1e-6), 5e-4))
+
+            del sweep_model
+            torch.cuda.empty_cache()
+            print(f"[LRFinder] Suggested LR: {suggested_lr:.2e}")
+            return suggested_lr
+
+        except Exception as exc:
+            print(f"[LRFinder] Sweep failed ({exc}); using fallback {fallback_lr:.0e}")
+            return fallback_lr
+
+    learning_rate = _find_lr(model, train_ds, tokenizer,
+                              fallback_lr=cfg["learning_rate_fallback"])
+    print(f"[AutoHP] learning_rate  : {learning_rate:.2e}")
+
+    # -----------------------------------------------------------------------
+    # Run SFTTrainer
+    # -----------------------------------------------------------------------
+    from transformers import EarlyStoppingCallback
+    from trl import SFTTrainer, SFTConfig
+
+    print("\nStarting SFT training...")
+    t0 = time.time()
+
+    checkpoints_dir = str(output_path / "checkpoints")
+    sft_config = SFTConfig(
+        output_dir=checkpoints_dir,
+        max_steps=max_steps,
+        num_train_epochs=cfg["max_epochs"],
+        per_device_train_batch_size=cfg["per_device_train_batch_size"],
+        auto_find_batch_size=cfg["auto_find_batch_size"],
+        gradient_accumulation_steps=cfg["gradient_accumulation_steps"],
+        learning_rate=learning_rate,
+        lr_scheduler_type=cfg["lr_scheduler"],
+        warmup_ratio=cfg["warmup_ratio"],
+        weight_decay=cfg["weight_decay"],
+        optim="adamw_torch",
+        fp16=False,
+        bf16=True,
+        gradient_checkpointing=True,
+        eval_strategy="steps",
+        eval_steps=cfg["eval_steps"],
+        load_best_model_at_end=cfg["load_best_model_at_end"],
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        logging_steps=50,
+        save_steps=cfg["eval_steps"],
+        save_total_limit=cfg["save_total_limit"],
+        report_to="none",
+        max_seq_length=cfg["max_seq_length"],
+        packing=True,
+        dataset_text_field="text",
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        args=sft_config,
+        callbacks=[EarlyStoppingCallback(
+            early_stopping_patience=cfg["early_stopping_patience"],
+        )],
+    )
+
+    train_result = trainer.train()
+
+    elapsed = time.time() - t0
+    print(f"\nTraining finished in {elapsed/3600:.2f} h")
+    print(f"Final training loss : {train_result.training_loss:.4f}")
+    print(f"Total steps         : {train_result.global_step:,}")
+
+    # -----------------------------------------------------------------------
+    # Save adapter
+    # -----------------------------------------------------------------------
+    final_dir = output_path / "final-adapter"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(str(final_dir))
+    tokenizer.save_pretrained(str(final_dir))
+
+    summary = {
+        "model_name": MODEL_NAME,
+        "strategy": strategy,
+        "language": language,
+        "output_tag": output_tag,
+        "final_loss": train_result.training_loss,
+        "global_step": train_result.global_step,
+        "elapsed_hours": round(elapsed / 3600, 2),
+        "gpu": "a10g",
+        "use_unsloth": USE_UNSLOTH,
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
+        "learning_rate": learning_rate,
+        "max_steps": max_steps,
+        "num_training_examples": num_examples,
+    }
+    with (final_dir / "training_summary.json").open("w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"Adapter saved to {final_dir}")
+    print(f"Summary:\n{json.dumps(summary, indent=2)}")
+
+    # Commit volume so adapter persists after the container exits
+    volume.commit()
+    print(f"\nVolume committed. Adapter at /outputs/{output_tag}/final-adapter/")
+
+    print("\n=== Training complete ===")
+
+
+# ---------------------------------------------------------------------------
+# Modal local entrypoint
+# ---------------------------------------------------------------------------
+
+@app.local_entrypoint()
+def modal_main(
+    language: str = "",
+    max_steps: int = -1,
+    limit: int = 0,
+) -> None:
+    """
+    Trigger the remote Gemma E4B training job on Modal A10G.
+
+    Run with:
+        modal run train_gemma.py --language python
+        modal run train_gemma.py --language python --max-steps 50   # smoke test
+        modal run train_gemma.py                                    # generalist
+
+    Retrieve adapter after training:
+        modal volume get model-fine-tuning-vol /outputs/gemma-e4b-python/final-adapter ./gemma-python-adapter
+    """
+    lang = language.strip() or None
+    strategy = "per-language" if lang else "generalist"
+    tag = f"gemma-e4b-{lang}" if lang else "gemma-e4b-generalist"
+
+    print("Submitting Gemma E4B training job to Modal...")
+    print(f"  GPU       : A10G (~$1.10/hr)")
+    print(f"  Timeout   : 4 hours")
+    print(f"  Strategy  : {strategy}")
+    print(f"  Language  : {lang or 'all (generalist)'}")
+    print(f"  Volume    : model-fine-tuning-vol")
+    print(f"  Output    : /outputs/{tag}/")
+    if limit > 0:
+        print(f"  [Smoke] limit     : {limit} examples")
+    if max_steps > 0:
+        print(f"  [Smoke] max-steps : {max_steps}")
+    print()
+
+    train_modal.remote(
+        language=lang,
+        strategy=strategy,
+        limit=limit if limit > 0 else None,
+        max_steps_override=max_steps,
+    )
 
 LANGUAGES = ["python", "go", "typescript", "java"]
 
