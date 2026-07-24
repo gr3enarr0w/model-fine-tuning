@@ -216,17 +216,20 @@ def train(
 
     # Accept any of the common HuggingFace token env var names
     hf_token = (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        or os.environ.get("HF_ACCESS_TOKEN")
-        or os.environ.get("HUGGINGFACE_TOKEN")
+        os.environ.get("HF_TOKEN", "").strip()
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN", "").strip()
+        or os.environ.get("HF_ACCESS_TOKEN", "").strip()
+        or os.environ.get("HUGGINGFACE_TOKEN", "").strip()
     )
     if not hf_token:
+        hf_related = {k: repr(v[:4] + "..." if v else "(empty)") for k, v in os.environ.items()
+                      if "HF" in k or "HUGGING" in k.upper()}
         raise EnvironmentError(
-            "HuggingFace token not found. Create the Modal secret with the correct key name:\n"
+            "HuggingFace token not found or is empty.\n"
+            "Recreate the Modal secret with a non-empty token value:\n"
+            "  modal secret delete huggingface-token\n"
             "  modal secret create huggingface-token HF_TOKEN=hf_...\n"
-            "Tried: HF_TOKEN, HUGGING_FACE_HUB_TOKEN, HF_ACCESS_TOKEN, HUGGINGFACE_TOKEN\n"
-            f"Env keys present: {[k for k in os.environ if 'HF' in k or 'HUGGING' in k.upper()]}"
+            f"HF-related env vars found: {hf_related}"
         )
 
     # Optional W&B setup
