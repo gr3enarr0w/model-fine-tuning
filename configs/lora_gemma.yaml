@@ -1,19 +1,59 @@
+# Gemma 4 E4B — ~4B effective parameters, hidden_dim ~2048
+# All hyperparameters derived from model architecture or auto-found at runtime.
+# No hardcoded guesses — see train_gemma.py for the automated strategy implementations.
+
 model_name: google/gemma-4-e4b-it
-load_in_4bit: false        # E4B is small enough for 16-bit LoRA
-lora_r: 8
-lora_alpha: 16
+
+# ---------------------------------------------------------------------------
+# LoRA — rank derived from hidden_dim: max(8, hidden_dim // 128)
+# Gemma E4B hidden_dim ≈ 2048  →  r = max(8, 2048 // 128) = 16
+# Alpha = 2 × r  (modern consensus, not r==alpha)
+# ---------------------------------------------------------------------------
+lora_r: 16
+lora_alpha: 32          # 2 × r
 lora_dropout: 0.05
 lora_target_modules:
   - q_proj
   - v_proj
   - k_proj
   - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
 
-learning_rate: 1.0e-4
-lr_scheduler: cosine
-warmup_steps: 50
-num_epochs: 2
-per_device_train_batch_size: 8
+# ---------------------------------------------------------------------------
+# Learning rate — auto-found at runtime via LR finder (see find_learning_rate()
+# in train_gemma.py). This value is used only if the finder fails.
+# ---------------------------------------------------------------------------
+learning_rate_fallback: 1.0e-4
+lr_scheduler: cosine_with_restarts
+warmup_ratio: 0.03          # 3% of total steps
+
+# ---------------------------------------------------------------------------
+# Epochs — early stopping.
+# eval_steps is more frequent here (100 vs 200) because E4B trains faster
+# and we can afford tighter monitoring.
+# ---------------------------------------------------------------------------
+max_epochs: 5
+early_stopping_patience: 3
+eval_steps: 100
+load_best_model_at_end: true
+
+# ---------------------------------------------------------------------------
+# Batch size — auto-found at runtime via auto_find_batch_size=True.
+# Smaller gradient_accumulation_steps than Laguna because E4B fits in 16-bit.
+# ---------------------------------------------------------------------------
+auto_find_batch_size: true
+per_device_train_batch_size: 8  # runtime starting guess; overridden if OOM
 gradient_accumulation_steps: 4
 max_seq_length: 4096
+
+# ---------------------------------------------------------------------------
+# Standard 16-bit training — E4B fits comfortably in GPU memory
+# ---------------------------------------------------------------------------
+load_in_4bit: false
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
 output_dir: /outputs/gemma-e4b

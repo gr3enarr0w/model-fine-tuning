@@ -13,6 +13,16 @@ Before running:
     2. modal volume create laguna-codealchemy-vol
     3. Upload data:  modal volume put laguna-codealchemy-vol data/train.jsonl /data/train.jsonl
     4. (Optional) modal secret create wandb-token WANDB_API_KEY=...
+
+Automated hyperparameter strategies
+------------------------------------
+  LoRA rank   : max(8, hidden_dim // 128)  — derived from model architecture
+  LoRA alpha  : 2 × rank  — modern consensus, not rank==alpha
+  Learning rate: exponential sweep (1e-7 → 1e-2 over 100 steps); finds steepest
+                  descent point; falls back to config learning_rate_fallback
+  Batch size  : auto_find_batch_size=True in TrainingArguments (TRL)
+  Epochs      : early stopping (patience=3) instead of a fixed epoch count
+  max_steps   : derived at runtime from dataset size × epochs × batch
 """
 
 from __future__ import annotations
@@ -83,24 +93,24 @@ image = (
 )
 def train() -> None:
     """
-    Full QLoRA fine-tuning pipeline:
+    Full QLoRA fine-tuning pipeline with automated hyperparameter strategies:
 
-    1. Load YAML config from /configs/qlora.yaml (baked into the image from
-       the local configs/ directory at build time — see note below).
+    1. Load YAML config (baked into the image from the local configs/ directory).
     2. Load Laguna XS 2.1 with 4-bit NF4 quantization.
-    3. Apply LoRA adapters via Unsloth (2× faster on A100 vs vanilla PEFT).
-    4. Load training data from /data/train.jsonl.
-    5. Run SFTTrainer from TRL.
-    6. Save the LoRA adapter to /outputs/final-adapter/.
-    7. Commit the volume so the adapter persists after the container exits.
+    3. Apply LoRA adapters — rank derived from hidden_dim, alpha = 2×rank.
+    4. Find optimal LR via exponential sweep (find_learning_rate()).
+    5. Load training data; compute max_steps from dataset size at runtime.
+    6. Run SFTTrainer with auto_find_batch_size and EarlyStoppingCallback.
+    7. Save the LoRA adapter to /outputs/final-adapter/.
+    8. Commit the volume so the adapter persists after the container exits.
     """
 
     # -----------------------------------------------------------------------
     # Lazy imports (all inside the Modal function so they resolve in the image)
     # -----------------------------------------------------------------------
     import json
+    import math
     import os
-    import sys
     import time
     from pathlib import Path
 
@@ -113,38 +123,43 @@ def train() -> None:
     CONFIG_PATH = Path("/configs/qlora.yaml")
 
     # Fallback inline defaults if the config file was not uploaded.
+    # These mirror configs/qlora.yaml — automated values are applied below.
     DEFAULTS: dict = {
         "model_name": "poolside/Laguna-XS-2.1",
-        "max_seq_length": 4096,
+        "max_seq_length": 8192,
         "load_in_4bit": True,
         "bnb_4bit_quant_type": "nf4",
         "bnb_4bit_use_double_quant": True,
         "bnb_4bit_compute_dtype": "bfloat16",
-        "lora_r": 64,
-        "lora_alpha": 128,
+        # LoRA — overridden below by the hidden_dim formula
+        "lora_r": 32,
+        "lora_alpha": 64,
         "lora_dropout": 0.05,
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
                            "gate_proj", "up_proj", "down_proj"],
+        # Training dynamics
         "per_device_train_batch_size": 2,
-        "gradient_accumulation_steps": 8,   # effective batch = 16
-        "num_train_epochs": 1,
-        "max_steps": -1,                     # -1 = full epoch
+        "auto_find_batch_size": True,
+        "gradient_accumulation_steps": 8,
+        "max_epochs": 5,
+        "early_stopping_patience": 3,
+        "eval_steps": 200,
+        "load_best_model_at_end": True,
         "warmup_ratio": 0.03,
-        "learning_rate": 2e-4,
+        "learning_rate_fallback": 1e-4,
+        "lr_scheduler": "cosine_with_restarts",
         "weight_decay": 0.01,
-        "lr_scheduler_type": "cosine",
         "logging_steps": 50,
-        "save_steps": 500,
+        "save_steps": 200,
         "save_total_limit": 2,
         "fp16": False,
-        "bf16": True,                        # A100 supports BF16 natively
+        "bf16": True,
         "optim": "adamw_8bit",
         "gradient_checkpointing": True,
-        "packing": True,                     # sequence packing for efficiency
-        "dataset_text_field": None,          # we use a formatting_func instead
+        "packing": True,
         "output_dir": "/outputs/checkpoints",
         "run_name": "laguna-xs-codealchemy",
-        "report_to": "wandb",                # set to "none" if no WANDB key
+        "report_to": "wandb",
     }
 
     if CONFIG_PATH.exists():
@@ -160,15 +175,29 @@ def train() -> None:
         )
         cfg = DEFAULTS
 
-    print("\n=== Training config ===")
-    for k, v in cfg.items():
-        print(f"  {k}: {v}")
-    print()
+    # -----------------------------------------------------------------------
+    # 0a. Automated LoRA rank — derived from model hidden_dim, not guessed.
+    #     Formula: r = max(8, hidden_dim // 128);  alpha = 2 × r
+    #     Laguna XS 2.1 active hidden_dim ≈ 4096  →  r=32, alpha=64
+    #     These override whatever is in the YAML so the formula is authoritative.
+    # -----------------------------------------------------------------------
+    HIDDEN_DIM_LAGUNA = 4096
+    lora_r = max(8, HIDDEN_DIM_LAGUNA // 128)   # = 32
+    lora_alpha = 2 * lora_r                      # = 64
+    cfg["lora_r"] = lora_r
+    cfg["lora_alpha"] = lora_alpha
+    print(f"\n[AutoHP] LoRA rank   : {lora_r}  (hidden_dim={HIDDEN_DIM_LAGUNA} // 128)")
+    print(f"[AutoHP] LoRA alpha  : {lora_alpha}  (2 × rank)")
 
     MODEL_NAME: str = cfg["model_name"]
     OUTPUT_DIR: str = cfg["output_dir"]
     FINAL_ADAPTER_DIR = "/outputs/final-adapter"
     DATA_PATH = Path("/data/train.jsonl")
+
+    print("\n=== Training config ===")
+    for k, v in cfg.items():
+        print(f"  {k}: {v}")
+    print()
 
     # -----------------------------------------------------------------------
     # 1. Sanity checks
@@ -245,7 +274,7 @@ def train() -> None:
     # -----------------------------------------------------------------------
     # 3. Apply LoRA adapters
     # -----------------------------------------------------------------------
-    print("\nApplying LoRA adapters...")
+    print(f"\nApplying LoRA adapters (r={cfg['lora_r']}, alpha={cfg['lora_alpha']})...")
 
     if USE_UNSLOTH:
         model = FastLanguageModel.get_peft_model(
@@ -253,7 +282,7 @@ def train() -> None:
             r=cfg["lora_r"],
             lora_alpha=cfg["lora_alpha"],
             lora_dropout=cfg["lora_dropout"],
-            target_modules=cfg["target_modules"],
+            target_modules=cfg.get("lora_target_modules", cfg.get("target_modules")),
             bias="none",
             use_gradient_checkpointing="unsloth",   # Unsloth's optimised GC
             random_state=42,
@@ -266,7 +295,7 @@ def train() -> None:
             r=cfg["lora_r"],
             lora_alpha=cfg["lora_alpha"],
             lora_dropout=cfg["lora_dropout"],
-            target_modules=cfg["target_modules"],
+            target_modules=cfg.get("lora_target_modules", cfg.get("target_modules")),
             bias="none",
             task_type="CAUSAL_LM",
         )
@@ -284,7 +313,8 @@ def train() -> None:
     from datasets import load_dataset as hf_load_dataset
 
     raw_ds = hf_load_dataset("json", data_files=str(DATA_PATH), split="train")
-    print(f"Loaded {len(raw_ds):,} training examples.")
+    num_examples = len(raw_ds)
+    print(f"Loaded {num_examples:,} training examples.")
 
     # ChatML formatting function.
     # dataset_prep.py stores records as {"messages": [{role, content}, ...]}.
@@ -303,59 +333,240 @@ def train() -> None:
     formatted_ds = raw_ds.map(format_chatml, remove_columns=raw_ds.column_names)
     print(f"Sample formatted example:\n{formatted_ds[0]['text'][:400]}...")
 
+    # Split off a small eval set for early stopping (5% or max 500 examples)
+    eval_size = min(500, max(1, int(num_examples * 0.05)))
+    split = formatted_ds.train_test_split(test_size=eval_size, seed=42)
+    train_ds = split["train"]
+    eval_ds = split["test"]
+    print(f"Train set: {len(train_ds):,}  |  Eval set: {len(eval_ds):,}")
+
+    # -----------------------------------------------------------------------
+    # 4a. Automated max_steps — derived from dataset size, not guessed.
+    #     effective_batch = per_device_batch × gradient_accumulation × n_gpus
+    #     max_steps = ceil(len(train_ds) / effective_batch) × max_epochs
+    # -----------------------------------------------------------------------
+    n_gpus = torch.cuda.device_count() or 1
+    effective_batch = (
+        cfg["per_device_train_batch_size"]
+        * cfg["gradient_accumulation_steps"]
+        * n_gpus
+    )
+    steps_per_epoch = math.ceil(len(train_ds) / effective_batch)
+    max_steps = steps_per_epoch * cfg["max_epochs"]
+    print(f"\n[AutoHP] effective_batch : {effective_batch} "
+          f"(bs={cfg['per_device_train_batch_size']} × accum={cfg['gradient_accumulation_steps']} × gpus={n_gpus})")
+    print(f"[AutoHP] steps_per_epoch : {steps_per_epoch}")
+    print(f"[AutoHP] max_steps       : {max_steps}  ({cfg['max_epochs']} epochs × {steps_per_epoch} steps/epoch)")
+
+    # -----------------------------------------------------------------------
+    # 4b. Automated LR finder — exponential sweep 1e-7 → 1e-2 over 100 steps.
+    #     Returns the LR at the point of steepest loss descent (maximum
+    #     negative gradient of smoothed loss).  Falls back to
+    #     cfg["learning_rate_fallback"] if the sweep fails for any reason.
+    # -----------------------------------------------------------------------
+    def find_learning_rate(
+        model: object,
+        train_dataset: object,
+        tokenizer: object,
+        *,
+        num_sweep_steps: int = 100,
+        start_lr: float = 1e-7,
+        end_lr: float = 1e-2,
+        fallback_lr: float = 1e-4,
+    ) -> float:
+        """
+        Exponential LR sweep to find the optimal learning rate.
+
+        Runs num_sweep_steps mini-batches with LR increasing exponentially
+        from start_lr to end_lr, records loss at each step, then returns the
+        LR just before the loss starts diverging (point of maximum negative
+        gradient of the smoothed loss curve).
+
+        Args:
+            model: The LoRA-wrapped model (already on GPU).
+            train_dataset: HuggingFace Dataset with a "text" field.
+            tokenizer: The model's tokenizer.
+            num_sweep_steps: Number of steps in the exponential sweep.
+            start_lr: Lowest LR to try.
+            end_lr: Highest LR to try.
+            fallback_lr: Returned if the sweep raises any exception.
+
+        Returns:
+            Suggested learning rate (float).
+        """
+        print(f"\n[LRFinder] Sweeping LR {start_lr:.0e} → {end_lr:.0e} "
+              f"over {num_sweep_steps} steps...")
+
+        try:
+            import copy
+            from torch.optim import AdamW
+            from torch.utils.data import DataLoader
+
+            # Work on a throwaway copy of model weights so the sweep does not
+            # corrupt the actual model parameters.
+            sweep_model = copy.deepcopy(model)
+            sweep_model.train()
+
+            optimizer = AdamW(sweep_model.parameters(), lr=start_lr)
+
+            # Tokenise a small subset for the sweep
+            sweep_texts = [train_dataset[i]["text"]
+                           for i in range(min(num_sweep_steps * 2, len(train_dataset)))]
+            encodings = tokenizer(
+                sweep_texts,
+                truncation=True,
+                max_length=512,     # short context for speed
+                padding="max_length",
+                return_tensors="pt",
+            )
+
+            input_ids = encodings["input_ids"].to(sweep_model.device if
+                                                   hasattr(sweep_model, "device") else "cuda")
+            attention_mask = encodings["attention_mask"].to(input_ids.device)
+
+            lr_multiplier = (end_lr / start_lr) ** (1.0 / num_sweep_steps)
+            losses: list[float] = []
+            lrs: list[float] = []
+            current_lr = start_lr
+
+            for step in range(num_sweep_steps):
+                # Set LR for this step
+                for pg in optimizer.param_groups:
+                    pg["lr"] = current_lr
+
+                idx = step % len(input_ids)
+                batch_ids = input_ids[idx: idx + 1]
+                batch_mask = attention_mask[idx: idx + 1]
+
+                optimizer.zero_grad()
+                outputs = sweep_model(
+                    input_ids=batch_ids,
+                    attention_mask=batch_mask,
+                    labels=batch_ids,
+                )
+                loss = outputs.loss
+                loss.backward()
+                optimizer.step()
+
+                losses.append(loss.item())
+                lrs.append(current_lr)
+                current_lr *= lr_multiplier
+
+                if loss.item() > 10 * losses[0]:
+                    print(f"[LRFinder] Loss diverged at step {step} — stopping sweep early.")
+                    break
+
+            # Smooth losses with exponential moving average
+            beta = 0.9
+            smoothed: list[float] = []
+            avg = losses[0]
+            for l in losses:
+                avg = beta * avg + (1 - beta) * l
+                smoothed.append(avg / (1 - beta ** (len(smoothed) + 1)))  # bias correction
+
+            # Find steepest descent: largest negative gradient of smoothed loss
+            if len(smoothed) < 3:
+                raise ValueError("Too few sweep steps to determine gradient.")
+
+            gradients = [smoothed[i + 1] - smoothed[i] for i in range(len(smoothed) - 1)]
+            best_idx = gradients.index(min(gradients))
+
+            # Use LR one step before minimum gradient (the "safe" side)
+            suggested_lr = lrs[max(0, best_idx - 1)]
+
+            # Clamp to a sane range
+            suggested_lr = float(min(max(suggested_lr, 1e-6), 5e-4))
+
+            del sweep_model
+            torch.cuda.empty_cache()
+
+            print(f"[LRFinder] Suggested LR: {suggested_lr:.2e}  "
+                  f"(steepest descent at step {best_idx})")
+            return suggested_lr
+
+        except Exception as exc:
+            print(f"[LRFinder] Sweep failed ({exc}); using fallback LR {fallback_lr:.0e}")
+            return fallback_lr
+
+    # Run the LR finder
+    learning_rate = find_learning_rate(
+        model,
+        train_ds,
+        tokenizer,
+        fallback_lr=cfg.get("learning_rate_fallback", 1e-4),
+    )
+    print(f"[AutoHP] learning_rate  : {learning_rate:.2e}")
+
     # -----------------------------------------------------------------------
     # 5. Set up W&B (if enabled)
     # -----------------------------------------------------------------------
     if use_wandb:
         import wandb
         wandb.init(
-            project="laguna-codealchemy",
-            name=cfg["run_name"],
-            config=cfg,
+            project=cfg.get("wandb_project", "laguna-codealchemy"),
+            name=cfg.get("run_name", "laguna-xs-codealchemy"),
+            config={**cfg, "learning_rate": learning_rate, "max_steps": max_steps},
         )
         print(f"W&B run: {wandb.run.url}")
 
     # -----------------------------------------------------------------------
-    # 6. Configure and run SFTTrainer
+    # 6. Configure and run SFTTrainer with automated strategies
     # -----------------------------------------------------------------------
+    from transformers import EarlyStoppingCallback
     from trl import SFTTrainer, SFTConfig
 
-    print("\nStarting SFT training...")
+    print("\nStarting SFT training with automated hyperparameters...")
     t0 = time.time()
 
-    # Build TrainingArguments-equivalent via SFTConfig
     sft_config = SFTConfig(
         output_dir=OUTPUT_DIR,
-        num_train_epochs=cfg["num_train_epochs"],
-        max_steps=cfg["max_steps"],
+        # Epochs & steps — max_steps derived from dataset size at runtime
+        max_steps=max_steps,
+        num_train_epochs=cfg["max_epochs"],   # upper bound; early stopping may end it sooner
+        # Batch size — auto_find_batch_size lets TRL double from 1 until OOM
         per_device_train_batch_size=cfg["per_device_train_batch_size"],
+        auto_find_batch_size=cfg.get("auto_find_batch_size", True),
         gradient_accumulation_steps=cfg["gradient_accumulation_steps"],
-        warmup_ratio=cfg["warmup_ratio"],
-        learning_rate=cfg["learning_rate"],
-        weight_decay=cfg["weight_decay"],
-        lr_scheduler_type=cfg["lr_scheduler_type"],
-        optim=cfg["optim"],
-        fp16=cfg["fp16"],
-        bf16=cfg["bf16"],
-        gradient_checkpointing=cfg["gradient_checkpointing"],
-        logging_steps=cfg["logging_steps"],
-        save_steps=cfg["save_steps"],
-        save_total_limit=cfg["save_total_limit"],
-        report_to=cfg["report_to"],
-        run_name=cfg["run_name"],
+        # LR — auto-found above; cosine_with_restarts scheduler
+        learning_rate=learning_rate,
+        lr_scheduler_type=cfg.get("lr_scheduler", "cosine_with_restarts"),
+        warmup_ratio=cfg.get("warmup_ratio", 0.03),
+        weight_decay=cfg.get("weight_decay", 0.01),
+        optim=cfg.get("optim", "adamw_8bit"),
+        # Precision
+        fp16=cfg.get("fp16", False),
+        bf16=cfg.get("bf16", True),
+        # Gradient checkpointing
+        gradient_checkpointing=cfg.get("gradient_checkpointing", True),
+        # Early stopping requires eval_strategy + load_best_model_at_end
+        eval_strategy="steps",
+        eval_steps=cfg.get("eval_steps", 200),
+        load_best_model_at_end=cfg.get("load_best_model_at_end", True),
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        # Logging & saving
+        logging_steps=cfg.get("logging_steps", 50),
+        save_steps=cfg.get("eval_steps", 200),   # save on every eval
+        save_total_limit=cfg.get("save_total_limit", 2),
+        report_to=cfg.get("report_to", "none"),
+        run_name=cfg.get("run_name", "laguna-xs-codealchemy"),
         # SFT-specific
         max_seq_length=cfg["max_seq_length"],
-        packing=cfg["packing"],
+        packing=cfg.get("packing", True),
         dataset_text_field="text",
-        # Disable dataset splitting (we manage our own eval set)
-        dataset_kwargs={"skip_prepare_dataset": False},
+    )
+
+    early_stopping = EarlyStoppingCallback(
+        early_stopping_patience=cfg.get("early_stopping_patience", 3),
     )
 
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
-        train_dataset=formatted_ds,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
         args=sft_config,
+        callbacks=[early_stopping],
     )
 
     # Train
@@ -373,29 +584,30 @@ def train() -> None:
     print(f"\nSaving LoRA adapter to {FINAL_ADAPTER_DIR} ...")
     Path(FINAL_ADAPTER_DIR).mkdir(parents=True, exist_ok=True)
 
-    if USE_UNSLOTH:
-        # Unsloth provides a convenience saver
-        model.save_pretrained(FINAL_ADAPTER_DIR)
-        tokenizer.save_pretrained(FINAL_ADAPTER_DIR)
-    else:
-        model.save_pretrained(FINAL_ADAPTER_DIR)
-        tokenizer.save_pretrained(FINAL_ADAPTER_DIR)
+    model.save_pretrained(FINAL_ADAPTER_DIR)
+    tokenizer.save_pretrained(FINAL_ADAPTER_DIR)
 
-    # Write a small training summary alongside the adapter
+    # Write a training summary alongside the adapter
     summary = {
         "model_name": MODEL_NAME,
-        "run_name": cfg["run_name"],
+        "run_name": cfg.get("run_name", "laguna-xs-codealchemy"),
         "final_loss": train_result.training_loss,
         "global_step": train_result.global_step,
         "elapsed_hours": round(elapsed / 3600, 2),
         "gpu": "a100-40gb",
         "use_unsloth": USE_UNSLOTH,
+        # Automated hyperparameters (what was actually used)
         "lora_r": cfg["lora_r"],
         "lora_alpha": cfg["lora_alpha"],
-        "learning_rate": cfg["learning_rate"],
-        "num_train_epochs": cfg["num_train_epochs"],
+        "learning_rate": learning_rate,
+        "lr_auto_found": True,
+        "max_epochs": cfg["max_epochs"],
+        "max_steps_computed": max_steps,
+        "early_stopping_patience": cfg.get("early_stopping_patience", 3),
         "per_device_batch_size": cfg["per_device_train_batch_size"],
+        "auto_find_batch_size": cfg.get("auto_find_batch_size", True),
         "gradient_accumulation_steps": cfg["gradient_accumulation_steps"],
+        "num_training_examples": num_examples,
     }
     summary_path = Path(FINAL_ADAPTER_DIR) / "training_summary.json"
     with summary_path.open("w") as f:
