@@ -214,11 +214,19 @@ def train(
     # -----------------------------------------------------------------------
     # Training data is streamed directly from HuggingFace — no local file needed.
 
-    hf_token = os.environ.get("HF_TOKEN")
+    # Accept any of the common HuggingFace token env var names
+    hf_token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or os.environ.get("HF_ACCESS_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+    )
     if not hf_token:
         raise EnvironmentError(
-            "HF_TOKEN not set. Create the Modal secret:\n"
-            "  modal secret create huggingface-token HF_TOKEN=hf_..."
+            "HuggingFace token not found. Create the Modal secret with the correct key name:\n"
+            "  modal secret create huggingface-token HF_TOKEN=hf_...\n"
+            "Tried: HF_TOKEN, HUGGING_FACE_HUB_TOKEN, HF_ACCESS_TOKEN, HUGGINGFACE_TOKEN\n"
+            f"Env keys present: {[k for k in os.environ if 'HF' in k or 'HUGGING' in k.upper()]}"
         )
 
     # Optional W&B setup
