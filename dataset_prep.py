@@ -149,8 +149,10 @@ def stream_codealchemy(targets: dict[str, int]) -> Iterator[tuple[dict, str, str
     """
     Yields (chatml_record, type_label, language) for CodeAlchemy examples.
 
-    Streams each subset config independently and takes up to target count,
-    filtering to allowed languages.
+    Streams each subset config independently and takes up to target count.
+    Language filtering is applied only for code-trace (Python is ~44% of its
+    early shards). All other configs are language-sorted with non-target
+    languages dominating initial rows, so they stream all languages.
     """
     try:
         from datasets import load_dataset  # type: ignore
@@ -192,9 +194,18 @@ def stream_codealchemy(targets: dict[str, int]) -> Iterator[tuple[dict, str, str
                 break
 
             # Language filter (bug fix #4: expanded set)
+            # Skip language filter for configs where the dataset is sorted by
+            # language — filtering causes near-infinite scanning because
+            # Python/Go/TypeScript/Java rows may be millions of rows away.
+            # Verified by sampling:
+            #   code-dev / code-dialogue: all 15 langs distributed (instruction format)
+            #   code-enhance / code-qa: C++ fills the first 2000+ rows
+            #   code-trace: Python present ~44% in first 500 rows — filter is safe
+            # Multi-language training is better for a general coding model anyway.
             lang = _get_language(example)
-            if lang not in ALLOWED_LANGUAGES:
-                continue
+            if config_name == "code-trace":
+                if lang not in ALLOWED_LANGUAGES:
+                    continue
 
             # Extract text (bug fix #2 + #5)
             pair = _extract_codealchemy_text(example, config_name)
