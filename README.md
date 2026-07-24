@@ -51,5 +51,47 @@ Evaluate per language: HumanEval, multi-turn debugging, code review quality, inf
 | `train_gemma.py` | Gemma E4B LoRA — both strategies |
 | `serve.py` | Laguna Modal OpenAI-compatible endpoint |
 | `benchmark.py` | Strategy A vs B evaluation per language |
-| `configs/qlora_laguna.yaml` | Laguna hyperparameters |
+| `upload_to_modal.py` | Upload local datasets/artifacts to Modal volume |
+| `download_from_modal.py` | Download trained adapters from Modal volume |
+| `merge_adapters.py` | Merge LoRA adapter weights into base model for deployment |
+| `push_to_ollama.py` | Convert merged model to GGUF and register with Ollama |
+| `run_all_parallel.py` | Launch all per-language Gemma fine-tunes in parallel |
+| `configs/qlora.yaml` | Laguna QLoRA hyperparameters |
 | `configs/lora_gemma.yaml` | Gemma hyperparameters |
+
+## Getting Started
+
+```bash
+# 1. Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Configure Modal (for cloud training)
+modal setup
+
+# 4. (Optional) Log in to Hugging Face for gated models
+huggingface-cli login
+
+# 5. Prepare datasets
+python dataset_prep.py
+
+# 6. Train (choose one)
+python train.py                          # Laguna on Modal
+python train_gemma.py --strategy per-lang  # Gemma per-language on Modal
+python train_gemma.py --strategy generalist
+
+# 7. Download trained adapters from Modal
+python download_from_modal.py --model gemma-python
+
+# 8. Merge adapter into base model
+python merge_adapters.py --model gemma-python --output merged/gemma-python
+
+# 9. Convert to GGUF and push to Ollama
+python push_to_ollama.py --model gemma-python --quantize q5_k_m
+
+# 10. Benchmark strategies
+python benchmark.py
+```
