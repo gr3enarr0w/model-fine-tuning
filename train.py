@@ -58,7 +58,10 @@ image = (
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
-        "transformers>=4.45.0",
+        # transformers pinned below 4.51 to avoid the strict YaRN RoPE validation
+        # introduced in 4.51 that crashes on poolside/Laguna-XS-2.1's config
+        # (KeyError: 'original_max_position_embeddings').
+        "transformers>=4.45.0,<4.51.0",
         "accelerate>=0.34.0",
         "peft>=0.13.0",
         "bitsandbytes>=0.44.0",
@@ -263,7 +266,7 @@ def train(
         print(f"Unsloth load failed ({exc}); falling back to HuggingFace PEFT...")
         USE_UNSLOTH = False
 
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
         bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=cfg["load_in_4bit"],
@@ -272,9 +275,32 @@ def train(
             bnb_4bit_compute_dtype=getattr(torch, cfg["bnb_4bit_compute_dtype"]),
         )
 
+        # Load the model config first so we can patch the rope_scaling dict if
+        # it's a YaRN config that's missing 'original_max_position_embeddings'.
+        # This avoids a KeyError introduced by strict RoPE validation in newer
+        # transformers versions (>= 4.51).
+        hf_config = AutoConfig.from_pretrained(
+            MODEL_NAME, token=hf_token, trust_remote_code=True
+        )
+        if (
+            hasattr(hf_config, "rope_scaling")
+            and isinstance(hf_config.rope_scaling, dict)
+            and hf_config.rope_scaling.get("type") in ("yarn", "dynamic-yarn")
+            and "original_max_position_embeddings" not in hf_config.rope_scaling
+        ):
+            print(
+                "[rope_patch] YaRN rope_scaling missing "
+                "'original_max_position_embeddings'; injecting default "
+                f"(= max_position_embeddings={hf_config.max_position_embeddings})."
+            )
+            hf_config.rope_scaling["original_max_position_embeddings"] = (
+                hf_config.max_position_embeddings
+            )
+
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=hf_token, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
+            config=hf_config,
             quantization_config=bnb_cfg,
             device_map="auto",
             token=hf_token,
