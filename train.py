@@ -71,10 +71,9 @@ image = (
         "wandb",
     )
     .pip_install(
-        # Unsloth last — it auto-detects torch/CUDA and compiles kernels
-        "unsloth[cu121-ampere-torch240] @ https://github.com/unslothai/unsloth/archive/refs/heads/main.zip",
-        # Fallback: if the URL above fails, use the PyPI release:
-        # "unsloth",
+        # Unsloth last — install core package only (no flash-attn extra that
+        # requires NVCC at image-build time; kernels are loaded at runtime).
+        "unsloth",
     )
 )
 
