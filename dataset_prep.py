@@ -348,7 +348,10 @@ def parse_args():
     p = argparse.ArgumentParser(description="Prepare fine-tuning data.")
     p.add_argument("--limit", type=int, default=None,
         help="Cap examples per source for smoke testing (e.g. --limit 200)")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.limit is not None and args.limit < 2:
+        p.error("--limit must be >= 2")
+    return args
 
 
 def main() -> None:
@@ -358,10 +361,14 @@ def main() -> None:
 
     # Apply --limit to reduce targets for smoke testing
     if args.limit:
-        print(f"[SMOKE TEST] Limiting each source to {args.limit} examples")
-        targets = {k: min(v, max(1, args.limit * v // CODEALCHEMY_TOTAL))
-                   for k, v in CODEALCHEMY_TARGETS.items()}
-        agentic_limit = args.limit
+        print(f"[SMOKE TEST] Limiting total examples to {args.limit}")
+        total_ca_target = CODEALCHEMY_TOTAL  # 100_000
+        targets = {
+            k: round(args.limit * (v / (total_ca_target + AGENTIC_TOTAL)))
+            for k, v in CODEALCHEMY_TARGETS.items()
+        }
+        agentic_limit = args.limit - sum(targets.values())
+        agentic_limit = max(0, agentic_limit)
     else:
         targets = CODEALCHEMY_TARGETS
         agentic_limit = AGENTIC_TOTAL

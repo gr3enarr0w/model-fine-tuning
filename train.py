@@ -332,15 +332,15 @@ def train(
         parts.append("<|im_start|>assistant\n")   # open for generation
         return {"text": "\n".join(parts)}
 
+    # --limit: slice raw dataset first, then format (avoids formatting discarded records)
+    if limit is not None:
+        cap = min(limit, len(raw_ds))
+        raw_ds = raw_ds.select(range(cap))
+        print(f"[Smoke] --limit applied: using {cap:,} of {num_examples:,} examples.")
+
     # Pre-format so SFTTrainer can work with the "text" field.
     formatted_ds = raw_ds.map(format_chatml, remove_columns=raw_ds.column_names)
     print(f"Sample formatted example:\n{formatted_ds[0]['text'][:400]}...")
-
-    # --limit: cap dataset size for smoke testing
-    if limit is not None:
-        cap = min(limit, len(formatted_ds))
-        formatted_ds = formatted_ds.select(range(cap))
-        print(f"[Smoke] --limit applied: using {cap:,} of {num_examples:,} examples.")
 
     # Split off a small eval set for early stopping (5% or max 500 examples)
     eval_size = min(500, max(1, int(len(formatted_ds) * 0.05)))
@@ -665,6 +665,8 @@ def main(
     Retrieve the adapter after training:
         modal volume get laguna-codealchemy-vol /outputs/final-adapter ./final-adapter
     """
+    if limit > 0 and limit < 2:
+        raise SystemExit("--limit must be >= 2")
     print("Submitting training job to Modal...")
     print("  GPU     : A100 40 GB")
     print("  Timeout : 7 hours")

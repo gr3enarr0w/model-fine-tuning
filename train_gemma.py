@@ -593,6 +593,8 @@ def parse_args() -> argparse.Namespace:
         p.error("--language is required when --strategy is per-language")
     if args.strategy == "generalist" and args.language:
         p.error("--language must not be set when --strategy is generalist")
+    if args.limit is not None and args.limit < 2:
+        p.error("--limit must be >= 2")
     return args
 
 
@@ -967,9 +969,10 @@ def main() -> None:
             r=cfg["lora_r"],
             lora_alpha=cfg["lora_alpha"],
             lora_dropout=cfg.get("lora_dropout", 0.05),
-            target_modules=cfg.get("lora_target_modules",
-                                   ["q_proj", "v_proj", "k_proj", "o_proj",
-                                    "gate_proj", "up_proj", "down_proj"]),
+            target_modules=cfg.get("target_modules",
+                                   cfg.get("lora_target_modules",
+                                           ["q_proj", "v_proj", "k_proj", "o_proj",
+                                            "gate_proj", "up_proj", "down_proj"])),
             bias="none",
             use_gradient_checkpointing="unsloth",
             random_state=42,
@@ -996,9 +999,10 @@ def main() -> None:
             r=cfg["lora_r"],
             lora_alpha=cfg["lora_alpha"],
             lora_dropout=cfg.get("lora_dropout", 0.05),
-            target_modules=cfg.get("lora_target_modules",
-                                   ["q_proj", "v_proj", "k_proj", "o_proj",
-                                    "gate_proj", "up_proj", "down_proj"]),
+            target_modules=cfg.get("target_modules",
+                                   cfg.get("lora_target_modules",
+                                           ["q_proj", "v_proj", "k_proj", "o_proj",
+                                            "gate_proj", "up_proj", "down_proj"])),
             bias="none",
             task_type="CAUSAL_LM",
         )
@@ -1033,13 +1037,13 @@ def main() -> None:
         parts.append("<|im_start|>assistant\n")
         return {"text": "\n".join(parts)}
 
-    formatted_ds = raw_ds.map(format_chatml, remove_columns=raw_ds.column_names)
-
-    # --limit: cap dataset size for smoke testing
+    # --limit: slice raw dataset first, then format (avoids formatting discarded records)
     if args.limit is not None:
-        cap = min(args.limit, len(formatted_ds))
-        formatted_ds = formatted_ds.select(range(cap))
+        cap = min(args.limit, len(raw_ds))
+        raw_ds = raw_ds.select(range(cap))
         print(f"[Smoke] --limit applied: using {cap:,} of {num_examples:,} examples.")
+
+    formatted_ds = raw_ds.map(format_chatml, remove_columns=raw_ds.column_names)
 
     # Split off eval set (5% or max 500 examples)
     eval_size = min(500, max(1, int(len(formatted_ds) * 0.05)))
