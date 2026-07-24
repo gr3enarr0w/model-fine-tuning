@@ -1,16 +1,16 @@
-# Laguna XS 2.1 — 33B MoE, active hidden_dim ~4096
+# Gemma 4 E4B — ~4B effective parameters, hidden_dim ~2048
 # All hyperparameters derived from model architecture or auto-found at runtime.
-# No hardcoded guesses — see train.py for the automated strategy implementations.
+# No hardcoded guesses — see train_gemma.py for the automated strategy implementations.
 
-model_name: poolside/Laguna-XS-2.1
+model_name: google/gemma-4-e4b-it
 
 # ---------------------------------------------------------------------------
 # LoRA — rank derived from hidden_dim: max(8, hidden_dim // 128)
-# Laguna active hidden_dim ≈ 4096  →  r = max(8, 4096 // 128) = 32
-# Alpha = 2 × r  (modern consensus from hundreds of experiments, not r==alpha)
+# Gemma E4B hidden_dim ≈ 2048  →  r = max(8, 2048 // 128) = 16
+# Alpha = 2 × r  (modern consensus, not r==alpha)
 # ---------------------------------------------------------------------------
-lora_r: 32
-lora_alpha: 64          # 2 × r
+lora_r: 16
+lora_alpha: 32          # 2 × r
 lora_dropout: 0.05
 lora_target_modules:
   - q_proj
@@ -23,42 +23,37 @@ lora_target_modules:
 
 # ---------------------------------------------------------------------------
 # Learning rate — auto-found at runtime via LR finder (see find_learning_rate()
-# in train.py). This value is used only if the finder fails.
+# in train_gemma.py). This value is used only if the finder fails.
 # ---------------------------------------------------------------------------
 learning_rate_fallback: 1.0e-4
 lr_scheduler: cosine_with_restarts
-warmup_ratio: 0.03          # 3% of total steps (not a fixed count)
+warmup_ratio: 0.03          # 3% of total steps
 
 # ---------------------------------------------------------------------------
-# Epochs — early stopping replaces the fixed epoch count.
-# Training stops when eval loss has not improved for `early_stopping_patience`
-# consecutive evaluations.
+# Epochs — early stopping.
+# eval_steps is more frequent here (100 vs 200) because E4B trains faster
+# and we can afford tighter monitoring.
 # ---------------------------------------------------------------------------
 max_epochs: 5
 early_stopping_patience: 3
-eval_steps: 200
+eval_steps: 100
 load_best_model_at_end: true
 
 # ---------------------------------------------------------------------------
-# Batch size — auto-found at runtime via auto_find_batch_size=True in
-# TrainingArguments (TRL / Hugging Face).  Gradient accumulation is kept
-# large so the effective batch stays reasonable even at batch_size=1.
+# Batch size — auto-found at runtime via auto_find_batch_size=True.
+# Smaller gradient_accumulation_steps than Laguna because E4B fits in 16-bit.
 # ---------------------------------------------------------------------------
 auto_find_batch_size: true
-per_device_train_batch_size: 2  # runtime starting guess; overridden if OOM
-gradient_accumulation_steps: 8  # effective batch = per_device_batch × accum × n_gpus
-max_seq_length: 8192
+per_device_train_batch_size: 8  # runtime starting guess; overridden if OOM
+gradient_accumulation_steps: 4
+max_seq_length: 4096
 
 # ---------------------------------------------------------------------------
-# QLoRA 4-bit quantization
+# Standard 16-bit training — E4B fits comfortably in GPU memory
 # ---------------------------------------------------------------------------
-load_in_4bit: true
-bnb_4bit_quant_type: nf4
-bnb_4bit_use_double_quant: true
-bnb_4bit_compute_dtype: bfloat16
+load_in_4bit: false
 
 # ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
-output_dir: /outputs/laguna-codealchemy-adapter
-wandb_project: laguna-codealchemy
+output_dir: /outputs/gemma-e4b
