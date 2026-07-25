@@ -141,7 +141,7 @@ def train(
     # These mirror configs/qlora.yaml — automated values are applied below.
     DEFAULTS: dict = {
         "model_name": "poolside/Laguna-XS-2.1",
-        "max_seq_length": 8192,
+        "max_seq_length": 4096,
         "load_in_4bit": True,
         "bnb_4bit_quant_type": "nf4",
         "bnb_4bit_use_double_quant": True,
@@ -155,7 +155,7 @@ def train(
         # Training dynamics
         "per_device_train_batch_size": 1,
         "auto_find_batch_size": True,
-        "gradient_accumulation_steps": 8,
+        "gradient_accumulation_steps": 16,
         "max_epochs": 5,
         "early_stopping_patience": 3,
         "eval_steps": 200,
@@ -262,6 +262,7 @@ def train(
             dtype=None,      # Unsloth auto-selects BF16 on A100
             token=hf_token,
             trust_remote_code=True,
+            offload_buffers=True,
         )
         USE_UNSLOTH = True
         print("Unsloth loaded successfully.")
@@ -687,6 +688,7 @@ def train(
             packing=cfg.get("packing", True),
             dataset_text_field="text",
             dataloader_num_workers=0,
+            dataloader_pin_memory=False,
         )
 
         early_stopping = EarlyStoppingCallback(
@@ -761,6 +763,7 @@ def train(
         total_seen = 0
 
         for batch_idx in range(max_batches):
+            torch.cuda.empty_cache()
             print(f"\n[ACT] Streaming batch {batch_idx + 1}/{max_batches} from HuggingFace...")
             batch = stream_hf_batch(batch_idx=batch_idx, batch_size=batch_size)
 
