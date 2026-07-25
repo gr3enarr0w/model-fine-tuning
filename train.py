@@ -152,7 +152,7 @@ def train(
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
                            "gate_proj", "up_proj", "down_proj"],
         # Training dynamics
-        "per_device_train_batch_size": 2,
+        "per_device_train_batch_size": 1,
         "auto_find_batch_size": True,
         "gradient_accumulation_steps": 8,
         "max_epochs": 5,
@@ -234,6 +234,9 @@ def train(
             "  modal secret create huggingface-token HF_TOKEN=hf_...\n"
             f"HF-related env vars found: {hf_related}"
         )
+
+    # CUDA memory allocator: expandable segments reduce fragmentation-driven OOMs
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Optional W&B setup
     wandb_key = os.environ.get("WANDB_API_KEY", "")
@@ -683,6 +686,7 @@ def train(
             max_seq_length=cfg["max_seq_length"],
             packing=cfg.get("packing", True),
             dataset_text_field="text",
+            dataloader_num_workers=0,
         )
 
         early_stopping = EarlyStoppingCallback(
@@ -699,6 +703,7 @@ def train(
         )
 
         try:
+            torch.cuda.empty_cache()
             trainer.train()
             # Pull best eval_loss from trainer state
             best_loss = getattr(trainer.state, "best_metric", None)
