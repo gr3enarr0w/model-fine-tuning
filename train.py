@@ -141,7 +141,7 @@ def train(
     # These mirror configs/qlora.yaml — automated values are applied below.
     DEFAULTS: dict = {
         "model_name": "poolside/Laguna-XS-2.1",
-        "max_seq_length": 4096,
+        "max_seq_length": 2048,
         "load_in_4bit": True,
         "bnb_4bit_quant_type": "nf4",
         "bnb_4bit_use_double_quant": True,
