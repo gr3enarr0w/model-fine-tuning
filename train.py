@@ -169,7 +169,7 @@ def train(
         "save_total_limit": 2,
         "fp16": False,
         "bf16": True,
-        "optim": "adamw_8bit",
+        "optim": "paged_adamw_8bit",
         "gradient_checkpointing": True,
         "packing": True,
         "output_dir": "/outputs/checkpoints",
@@ -236,8 +236,8 @@ def train(
             f"HF-related env vars found: {hf_related}"
         )
 
-    # CUDA memory allocator: expandable segments reduce fragmentation-driven OOMs
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # CUDA memory allocator: expandable segments + split-size cap reduce fragmentation-driven OOMs
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
 
     # Optional W&B setup
     wandb_key = os.environ.get("WANDB_API_KEY", "")
