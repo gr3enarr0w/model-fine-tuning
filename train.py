@@ -149,7 +149,7 @@ def train(
         # LoRA — overridden below by the hidden_dim formula
         "lora_r": 32,
         "lora_alpha": 64,
-        "lora_dropout": 0.05,
+        "lora_dropout": 0,  # Unsloth requires 0 for fast patching (ParamWrapper constraint)
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
                            "gate_proj", "up_proj", "down_proj"],
         # Training dynamics
