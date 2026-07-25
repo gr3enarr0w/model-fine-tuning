@@ -7,3 +7,7 @@ __pycache__/
 *.pyc
 .env
 wandb/
+.DS_Store
+.modal/
+*.egg-info/
+merged/

@@ -11,8 +11,11 @@ Free credits cover this comfortably within the $30 allowance.
 Before running:
     1. modal secret create huggingface-token HF_TOKEN=hf_...
     2. modal volume create laguna-codealchemy-vol
-    3. Upload data:  modal volume put laguna-codealchemy-vol data/train.jsonl /data/train.jsonl
-    4. (Optional) modal secret create wandb-token WANDB_API_KEY=...
+    3. (Optional) modal secret create wandb-token WANDB_API_KEY=...
+
+Note: Training data is now streamed directly from HuggingFace at runtime —
+no local upload required. Sources: open-alchemy/code-alchemy (all 5 configs)
++ WaltonFuture/agentic-sft-new.
 
 Automated hyperparameter strategies
 ------------------------------------
@@ -23,6 +26,8 @@ Automated hyperparameter strategies
   Batch size  : auto_find_batch_size=True in TrainingArguments (TRL)
   Epochs      : early stopping (patience=3) instead of a fixed epoch count
   max_steps   : derived at runtime from dataset size × epochs × batch
+  Data volume : ACT controller — feeds 50k-example batches, stops when val loss
+                improvement < epsilon (0.005); hard ceiling of 4 batches (200k)
 """
 
 from __future__ import annotations
@@ -44,7 +49,8 @@ volume = modal.Volume.from_name("laguna-codealchemy-vol", create_if_missing=True
 # Unsloth is installed last because it pins specific torch/cuda versions;
 # installing it after the others lets pip resolve cleanly.
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry("nvidia/cuda:12.1.0-devel-ubuntu22.04", add_python="3.11")
+    .apt_install("libnvjitlink-12-1")
     .pip_install(
         # Core ML stack — pin torch to a CUDA 12.1 wheel that Unsloth expects
         "torch==2.4.1",
@@ -53,6 +59,9 @@ image = (
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
+        # Note: transformers version is largely controlled by Unsloth's own pinning.
+        # The strict YaRN RoPE validation (KeyError: 'original_max_position_embeddings')
+        # is handled in the fallback path below via the AutoConfig patch.
         "transformers>=4.45.0",
         "accelerate>=0.34.0",
         "peft>=0.13.0",
@@ -66,10 +75,9 @@ image = (
         "wandb",
     )
     .pip_install(
-        # Unsloth last — it auto-detects torch/CUDA and compiles kernels
-        "unsloth[cu121-ampere-torch240] @ https://github.com/unslothai/unsloth/archive/refs/heads/main.zip",
-        # Fallback: if the URL above fails, use the PyPI release:
-        # "unsloth",
+        # Unsloth last — install core package only (no flash-attn extra that
+        # requires NVCC at image-build time; kernels are loaded at runtime).
+        "unsloth",
     )
 )
 
@@ -79,19 +87,25 @@ image = (
 
 @app.function(
     gpu="a100-40gb",
-    timeout=7 * 3600,          # 7-hour hard cap (run typically finishes in 4-6h)
+    timeout=14 * 3600,         # 14-hour hard cap (was 7h; HF streaming runs longer)
     volumes={
-        "/data": volume,
-        "/outputs": volume,
+        "/outputs": volume,   # persist LoRA adapter; /data not needed (data streamed from HF)
     },
     image=image,
     secrets=[
         modal.Secret.from_name("huggingface-token"),
-        modal.Secret.from_name("wandb-token", required=False),  # optional
+        # wandb-token omitted — create it if you want W&B logging:
+        #   modal secret create wandb-token WANDB_API_KEY=...
     ],
     memory=65536,              # 64 GB RAM to handle tokenization buffers
 )
-def train() -> None:
+def train(
+    max_steps_override: int = -1,
+    use_act: bool = True,
+    act_batch_size: int = 50_000,
+    act_epsilon: float = 0.005,
+    act_max_batches: int = 4,
+) -> None:
     """
     Full QLoRA fine-tuning pipeline with automated hyperparameter strategies:
 
@@ -99,7 +113,8 @@ def train() -> None:
     2. Load Laguna XS 2.1 with 4-bit NF4 quantization.
     3. Apply LoRA adapters — rank derived from hidden_dim, alpha = 2×rank.
     4. Find optimal LR via exponential sweep (find_learning_rate()).
-    5. Load training data; compute max_steps from dataset size at runtime.
+    5. ACT controller: feeds data in 50k batches, stops when val loss
+       improvement < epsilon (0.005); hard ceiling 4 batches (200k examples).
     6. Run SFTTrainer with auto_find_batch_size and EarlyStoppingCallback.
     7. Save the LoRA adapter to /outputs/final-adapter/.
     8. Commit the volume so the adapter persists after the container exits.
@@ -126,7 +141,7 @@ def train() -> None:
     # These mirror configs/qlora.yaml — automated values are applied below.
     DEFAULTS: dict = {
         "model_name": "poolside/Laguna-XS-2.1",
-        "max_seq_length": 8192,
+        "max_seq_length": 2048,
         "load_in_4bit": True,
         "bnb_4bit_quant_type": "nf4",
         "bnb_4bit_use_double_quant": True,
@@ -134,13 +149,13 @@ def train() -> None:
         # LoRA — overridden below by the hidden_dim formula
         "lora_r": 32,
         "lora_alpha": 64,
-        "lora_dropout": 0.05,
+        "lora_dropout": 0,  # Unsloth requires 0 for fast patching (ParamWrapper constraint)
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
                            "gate_proj", "up_proj", "down_proj"],
         # Training dynamics
-        "per_device_train_batch_size": 2,
+        "per_device_train_batch_size": 1,
         "auto_find_batch_size": True,
-        "gradient_accumulation_steps": 8,
+        "gradient_accumulation_steps": 16,
         "max_epochs": 5,
         "early_stopping_patience": 3,
         "eval_steps": 200,
@@ -154,7 +169,7 @@ def train() -> None:
         "save_total_limit": 2,
         "fp16": False,
         "bf16": True,
-        "optim": "adamw_8bit",
+        "optim": "paged_adamw_8bit",
         "gradient_checkpointing": True,
         "packing": True,
         "output_dir": "/outputs/checkpoints",
@@ -192,7 +207,6 @@ def train() -> None:
     MODEL_NAME: str = cfg["model_name"]
     OUTPUT_DIR: str = cfg["output_dir"]
     FINAL_ADAPTER_DIR = "/outputs/final-adapter"
-    DATA_PATH = Path("/data/train.jsonl")
 
     print("\n=== Training config ===")
     for k, v in cfg.items():
@@ -202,19 +216,28 @@ def train() -> None:
     # -----------------------------------------------------------------------
     # 1. Sanity checks
     # -----------------------------------------------------------------------
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(
-            f"Training data not found at {DATA_PATH}.\n"
-            "Upload it first:\n"
-            "  modal volume put laguna-codealchemy-vol data/train.jsonl /data/train.jsonl"
+    # Training data is streamed directly from HuggingFace — no local file needed.
+
+    # Accept any of the common HuggingFace token env var names
+    hf_token = (
+        os.environ.get("HF_TOKEN", "").strip()
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN", "").strip()
+        or os.environ.get("HF_ACCESS_TOKEN", "").strip()
+        or os.environ.get("HUGGINGFACE_TOKEN", "").strip()
+    )
+    if not hf_token:
+        hf_related = {k: repr(v[:4] + "..." if v else "(empty)") for k, v in os.environ.items()
+                      if "HF" in k or "HUGGING" in k.upper()}
+        raise EnvironmentError(
+            "HuggingFace token not found or is empty.\n"
+            "Recreate the Modal secret with a non-empty token value:\n"
+            "  modal secret delete huggingface-token\n"
+            "  modal secret create huggingface-token HF_TOKEN=hf_...\n"
+            f"HF-related env vars found: {hf_related}"
         )
 
-    hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
-        raise EnvironmentError(
-            "HF_TOKEN not set. Create the Modal secret:\n"
-            "  modal secret create huggingface-token HF_TOKEN=hf_..."
-        )
+    # CUDA memory allocator: expandable segments + split-size cap reduce fragmentation-driven OOMs
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
 
     # Optional W&B setup
     wandb_key = os.environ.get("WANDB_API_KEY", "")
@@ -238,6 +261,8 @@ def train() -> None:
             load_in_4bit=cfg["load_in_4bit"],
             dtype=None,      # Unsloth auto-selects BF16 on A100
             token=hf_token,
+            trust_remote_code=True,
+            offload_buffers=True,
         )
         USE_UNSLOTH = True
         print("Unsloth loaded successfully.")
@@ -246,7 +271,7 @@ def train() -> None:
         print(f"Unsloth load failed ({exc}); falling back to HuggingFace PEFT...")
         USE_UNSLOTH = False
 
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
         bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=cfg["load_in_4bit"],
@@ -255,12 +280,50 @@ def train() -> None:
             bnb_4bit_compute_dtype=getattr(torch, cfg["bnb_4bit_compute_dtype"]),
         )
 
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=hf_token)
+        # Monkey-patch the YaRN RoPE validator that was tightened in transformers >=4.51.
+        # poolside/Laguna-XS-2.1 ships a rope_scaling dict of type "yarn" that is
+        # missing 'original_max_position_embeddings', which causes a KeyError inside
+        # _validate_yarn_rope_parameters.  We wrap the validator to inject the missing
+        # key from max_position_embeddings before delegating to the original function.
+        try:
+            import transformers.modeling_rope_utils as _rope_utils
+
+            _orig_validate_yarn = _rope_utils._validate_yarn_rope_parameters
+
+            def _patched_validate_yarn(config, **kwargs):
+                rope = getattr(config, "rope_scaling", None) or {}
+                if (
+                    isinstance(rope, dict)
+                    and "original_max_position_embeddings" not in rope
+                    and hasattr(config, "max_position_embeddings")
+                ):
+                    print(
+                        "[rope_patch] Injecting missing "
+                        "'original_max_position_embeddings' into YaRN rope_scaling "
+                        f"(value={config.max_position_embeddings})."
+                    )
+                    rope["original_max_position_embeddings"] = config.max_position_embeddings
+                return _orig_validate_yarn(config, **kwargs)
+
+            _rope_utils._validate_yarn_rope_parameters = _patched_validate_yarn
+            print("[rope_patch] YaRN RoPE validator patched successfully.")
+        except Exception as patch_err:
+            print(f"[rope_patch] Could not patch YaRN validator ({patch_err}); proceeding anyway.")
+
+        # Load config first (with trust_remote_code) so we can also pass it
+        # directly to from_pretrained and avoid a second remote fetch.
+        hf_config = AutoConfig.from_pretrained(
+            MODEL_NAME, token=hf_token, trust_remote_code=True
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=hf_token, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
+            config=hf_config,
             quantization_config=bnb_cfg,
             device_map="auto",
             token=hf_token,
+            trust_remote_code=True,
         )
 
     # Ensure tokenizer has a pad token (needed for batch training)
@@ -306,18 +369,228 @@ def train() -> None:
     print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
     # -----------------------------------------------------------------------
-    # 4. Load training data
+    # 4. ACT controller helpers
     # -----------------------------------------------------------------------
-    print(f"\nLoading training data from {DATA_PATH}...")
 
-    from datasets import load_dataset as hf_load_dataset
+    # ------------------------------------------------------------------
+    # HuggingFace streaming helpers (replaces local load_jsonl)
+    # ------------------------------------------------------------------
 
-    raw_ds = hf_load_dataset("json", data_files=str(DATA_PATH), split="train")
-    num_examples = len(raw_ds)
-    print(f"Loaded {num_examples:,} training examples.")
+    # Dataset / config constants — same as dataset_prep.py
+    _HF_CODEALCHEMY = "open-alchemy/code-alchemy"
+    _HF_AGENTIC = "WaltonFuture/agentic-sft-new"
+    _HF_CA_CONFIGS = ["code-dev", "code-dialogue", "code-trace", "code-enhance", "code-qa"]
+    _HF_CA_PLACEHOLDER_CONFIGS = {"code-dev", "code-dialogue"}
+    _HF_CA_USER_PROMPTS = {
+        "code-dev": "Complete the following developer task:",
+        "code-dialogue": "Continue this development conversation:",
+        "code-trace": "Analyze this code execution trace:",
+        "code-enhance": "Review and improve this code:",
+        "code-qa": "Answer this code question:",
+    }
+    _HF_SYSTEM_PROMPT = (
+        "You are an expert software engineer working on a long-horizon coding task. "
+        "You write clean, tested, production-quality code."
+    )
 
-    # ChatML formatting function.
-    # dataset_prep.py stores records as {"messages": [{role, content}, ...]}.
+    def _hf_extract_record(example: dict, config_name: str) -> dict | None:
+        """Convert a raw HF example into a ChatML messages dict."""
+        import hashlib
+
+        # WaltonFuture/agentic-sft-new: already has messages list
+        if config_name == "__agentic__":
+            messages = example.get("messages") or example.get("conversations")
+            if not messages or not isinstance(messages, list):
+                return None
+            # normalise role names
+            normed = []
+            for m in messages:
+                role = str(m.get("role") or m.get("from") or "").lower()
+                content = str(m.get("content") or m.get("value") or "").strip()
+                if role in ("human", "user"):
+                    role = "user"
+                elif role in ("gpt", "assistant"):
+                    role = "assistant"
+                if content:
+                    normed.append({"role": role, "content": content})
+            if not normed:
+                return None
+            if normed[0]["role"] != "system":
+                normed.insert(0, {"role": "system", "content": _HF_SYSTEM_PROMPT})
+            return {"messages": normed}
+
+        # CodeAlchemy configs
+        if config_name in _HF_CA_PLACEHOLDER_CONFIGS:
+            raw_text = str(example.get("text_with_placeholders", "") or "").strip()
+        else:
+            raw_text = str(example.get("text", "") or "").strip()
+        if not raw_text:
+            return None
+        user_turn = _HF_CA_USER_PROMPTS.get(config_name, "Complete the following coding task:")
+        return {
+            "messages": [
+                {"role": "system", "content": _HF_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_turn},
+                {"role": "assistant", "content": raw_text},
+            ]
+        }
+
+    def stream_hf_batch(batch_idx: int, batch_size: int = 50_000) -> list[dict]:
+        """
+        Stream one batch of training examples from HuggingFace.
+
+        Covers CodeAlchemy (all 5 configs) + WaltonFuture/agentic-sft-new.
+        Skips batch_idx * batch_size rows globally (round-robin across sources),
+        deduplicates on SHA-256 of the assistant content, and returns up to
+        batch_size records formatted as ChatML messages dicts.
+
+        Args:
+            batch_idx:  0-based batch index (used to compute skip offset).
+            batch_size: Target number of examples to return.
+
+        Returns:
+            List of dicts with {"messages": [...]} in ChatML format.
+        """
+        from datasets import load_dataset
+        from tqdm import tqdm
+
+        skip = batch_idx * batch_size
+        # Allocate budget evenly across all 6 sources (5 CA configs + 1 agentic)
+        n_sources = len(_HF_CA_CONFIGS) + 1   # 6
+        per_source = batch_size // n_sources
+        skip_per_source = skip // n_sources
+
+        records: list[dict] = []
+        seen_hashes: set[str] = set()
+
+        def _collect(ds_iter, config_name: str, target: int, skip_n: int) -> None:
+            import hashlib
+            collected = 0
+            skipped = 0
+            for example in tqdm(ds_iter, desc=f"HF:{config_name}", unit="ex", leave=False):
+                if skipped < skip_n:
+                    skipped += 1
+                    continue
+                rec = _hf_extract_record(example, config_name)
+                if rec is None:
+                    continue
+                asst_content = next(
+                    (m["content"] for m in reversed(rec["messages"]) if m["role"] == "assistant"),
+                    "",
+                )
+                h = hashlib.sha256(asst_content[:512].encode("utf-8", errors="replace")).hexdigest()
+                if h in seen_hashes:
+                    continue
+                seen_hashes.add(h)
+                records.append(rec)
+                collected += 1
+                if collected >= target:
+                    break
+            print(f"  [HF] {config_name}: collected {collected:,} (skip={skip_n:,})")
+
+        # Stream CodeAlchemy configs
+        for config_name in _HF_CA_CONFIGS:
+            try:
+                ds = load_dataset(
+                    _HF_CODEALCHEMY,
+                    name=config_name,
+                    streaming=True,
+                )
+                split = ds.get("train", ds[next(iter(ds))])
+                _collect(split, config_name, per_source, skip_per_source)
+            except Exception as exc:
+                print(f"  [HF] WARNING: could not load {_HF_CODEALCHEMY}/{config_name}: {exc}")
+
+        # Stream WaltonFuture/agentic-sft-new
+        try:
+            ds = load_dataset(_HF_AGENTIC, streaming=True)
+            split = ds.get("train", ds[next(iter(ds))])
+            _collect(split, "__agentic__", per_source, skip_per_source)
+        except Exception as exc:
+            print(f"  [HF] WARNING: could not load {_HF_AGENTIC}: {exc}")
+
+        print(f"[HF] stream_hf_batch(idx={batch_idx}) → {len(records):,} records")
+        return records
+
+    def stream_hf_val(n: int = 5_000, skip: int = 50_000) -> list[dict]:
+        """
+        Stream a fixed validation set from HuggingFace.
+
+        Uses a consistent skip offset (default 50k) so the same examples are
+        returned on every call regardless of which ACT batch is running.
+
+        Args:
+            n:    Number of validation examples to collect.
+            skip: Row offset into the combined stream before collecting.
+
+        Returns:
+            List of ChatML messages dicts.
+        """
+        from datasets import load_dataset
+        from tqdm import tqdm
+        import hashlib
+
+        records: list[dict] = []
+        seen_hashes: set[str] = set()
+
+        # Pull val examples from CodeAlchemy code-qa (stable, diverse)
+        # then pad with agentic if needed.
+        sources = [
+            (_HF_CODEALCHEMY, "code-qa"),
+            (_HF_CODEALCHEMY, "code-enhance"),
+            (_HF_AGENTIC,     "__agentic__"),
+        ]
+        per_source = (n + len(sources) - 1) // len(sources)
+        skip_per = skip // len(sources)
+
+        for ds_name, config_name in sources:
+            if len(records) >= n:
+                break
+            try:
+                if config_name == "__agentic__":
+                    ds = load_dataset(ds_name, streaming=True)
+                else:
+                    ds = load_dataset(ds_name, name=config_name, streaming=True)
+                split = ds.get("train", ds[next(iter(ds))])
+                needed = min(per_source, n - len(records))
+                skipped = 0
+                for example in tqdm(split, desc=f"val:{config_name}", unit="ex", leave=False):
+                    if skipped < skip_per:
+                        skipped += 1
+                        continue
+                    rec = _hf_extract_record(example, config_name)
+                    if rec is None:
+                        continue
+                    asst_content = next(
+                        (m["content"] for m in reversed(rec["messages"]) if m["role"] == "assistant"),
+                        "",
+                    )
+                    h = hashlib.sha256(asst_content[:512].encode("utf-8", errors="replace")).hexdigest()
+                    if h in seen_hashes:
+                        continue
+                    seen_hashes.add(h)
+                    records.append(rec)
+                    if len(records) >= n:
+                        break
+            except Exception as exc:
+                print(f"  [HF] WARNING: could not load val from {ds_name}/{config_name}: {exc}")
+
+        print(f"[HF] stream_hf_val() → {len(records):,} val records")
+        return records
+
+    def load_jsonl(path: Path) -> list[dict]:
+        """Load a JSONL file into a list of dicts (used for temp val files)."""
+        records = []
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        return records
+
     def format_chatml(example: dict) -> dict:
         """Convert messages list to a single ChatML string."""
         messages = example.get("messages", [])
@@ -329,40 +602,225 @@ def train() -> None:
         parts.append("<|im_start|>assistant\n")   # open for generation
         return {"text": "\n".join(parts)}
 
-    # Pre-format so SFTTrainer can work with the "text" field.
-    formatted_ds = raw_ds.map(format_chatml, remove_columns=raw_ds.column_names)
-    print(f"Sample formatted example:\n{formatted_ds[0]['text'][:400]}...")
+    def train_on_batch(
+        model: object,
+        tokenizer: object,
+        batch_records: list[dict],
+        val_path_str: str,
+        cfg: dict,
+        output_dir: str,
+        max_steps_override: int = -1,
+    ) -> float:
+        """
+        Train SFTTrainer on a single batch of records; return best eval_loss.
 
-    # Split off a small eval set for early stopping (5% or max 500 examples)
-    eval_size = min(500, max(1, int(num_examples * 0.05)))
-    split = formatted_ds.train_test_split(test_size=eval_size, seed=42)
-    train_ds = split["train"]
-    eval_ds = split["test"]
-    print(f"Train set: {len(train_ds):,}  |  Eval set: {len(eval_ds):,}")
+        Returns float('inf') if training fails for any reason.
+        """
+        from datasets import Dataset as HFDataset
+        from transformers import EarlyStoppingCallback
+        from trl import SFTTrainer, SFTConfig
 
-    # -----------------------------------------------------------------------
-    # 4a. Automated max_steps — derived from dataset size, not guessed.
-    #     effective_batch = per_device_batch × gradient_accumulation × n_gpus
-    #     max_steps = ceil(len(train_ds) / effective_batch) × max_epochs
-    # -----------------------------------------------------------------------
-    n_gpus = torch.cuda.device_count() or 1
-    effective_batch = (
-        cfg["per_device_train_batch_size"]
-        * cfg["gradient_accumulation_steps"]
-        * n_gpus
-    )
-    steps_per_epoch = math.ceil(len(train_ds) / effective_batch)
-    max_steps = steps_per_epoch * cfg["max_epochs"]
-    print(f"\n[AutoHP] effective_batch : {effective_batch} "
-          f"(bs={cfg['per_device_train_batch_size']} × accum={cfg['gradient_accumulation_steps']} × gpus={n_gpus})")
-    print(f"[AutoHP] steps_per_epoch : {steps_per_epoch}")
-    print(f"[AutoHP] max_steps       : {max_steps}  ({cfg['max_epochs']} epochs × {steps_per_epoch} steps/epoch)")
+        # Build HF Dataset from the batch records
+        batch_ds = HFDataset.from_list(batch_records)
+        formatted_batch = batch_ds.map(
+            format_chatml,
+            remove_columns=batch_ds.column_names,
+            num_proc=1,
+        )
+
+        # Load fixed validation set (written by dataset_prep.py)
+        val_path = Path(val_path_str)
+        if val_path.exists():
+            val_records = load_jsonl(val_path)
+            val_ds_raw = HFDataset.from_list(val_records[:2000])  # cap at 2k for speed
+            eval_ds = val_ds_raw.map(format_chatml, remove_columns=val_ds_raw.column_names, num_proc=1)
+        else:
+            # Fallback: carve 5% / max 500 from batch itself
+            eval_size = min(500, max(1, int(len(formatted_batch) * 0.05)))
+            split = formatted_batch.train_test_split(test_size=eval_size, seed=42)
+            formatted_batch = split["train"]
+            eval_ds = split["test"]
+
+        train_ds = formatted_batch
+        print(f"  [batch] Train: {len(train_ds):,}  |  Eval: {len(eval_ds):,}")
+
+        # Derive max_steps for this batch
+        n_gpus = torch.cuda.device_count() or 1
+        effective_batch = (
+            cfg["per_device_train_batch_size"]
+            * cfg["gradient_accumulation_steps"]
+            * n_gpus
+        )
+        steps_per_epoch = math.ceil(len(train_ds) / effective_batch)
+        batch_max_steps = steps_per_epoch * cfg["max_epochs"]
+
+        if max_steps_override > 0:
+            batch_max_steps = max_steps_override
+            print(f"  [Smoke] --max-steps override: {batch_max_steps}")
+
+        print(f"  [batch] effective_batch={effective_batch}  steps/epoch={steps_per_epoch}  max_steps={batch_max_steps}")
+
+        sft_config = SFTConfig(
+            output_dir=output_dir,
+            max_steps=batch_max_steps,
+            num_train_epochs=cfg["max_epochs"],
+            per_device_train_batch_size=cfg["per_device_train_batch_size"],
+            auto_find_batch_size=cfg.get("auto_find_batch_size", True),
+            gradient_accumulation_steps=cfg["gradient_accumulation_steps"],
+            learning_rate=cfg.get("_act_learning_rate", cfg.get("learning_rate_fallback", 1e-4)),
+            lr_scheduler_type=cfg.get("lr_scheduler", "cosine_with_restarts"),
+            warmup_ratio=cfg.get("warmup_ratio", 0.03),
+            weight_decay=cfg.get("weight_decay", 0.01),
+            optim=cfg.get("optim", "adamw_8bit"),
+            fp16=cfg.get("fp16", False),
+            bf16=cfg.get("bf16", True),
+            gradient_checkpointing=cfg.get("gradient_checkpointing", True),
+            eval_strategy="steps",
+            eval_steps=cfg.get("eval_steps", 200),
+            load_best_model_at_end=cfg.get("load_best_model_at_end", True),
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            logging_steps=cfg.get("logging_steps", 50),
+            save_steps=cfg.get("eval_steps", 200),
+            save_total_limit=cfg.get("save_total_limit", 2),
+            report_to=cfg.get("report_to", "none"),
+            run_name=cfg.get("run_name", "laguna-xs-codealchemy"),
+            max_seq_length=cfg["max_seq_length"],
+            packing=cfg.get("packing", True),
+            dataset_text_field="text",
+            dataloader_num_workers=0,
+            dataloader_pin_memory=False,
+        )
+
+        early_stopping = EarlyStoppingCallback(
+            early_stopping_patience=cfg.get("early_stopping_patience", 3),
+        )
+
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_ds,
+            eval_dataset=eval_ds,
+            args=sft_config,
+            callbacks=[early_stopping],
+        )
+
+        try:
+            torch.cuda.empty_cache()
+            trainer.train()
+            # Pull best eval_loss from trainer state
+            best_loss = getattr(trainer.state, "best_metric", None)
+            if best_loss is None:
+                # Fallback: run evaluate() directly
+                eval_out = trainer.evaluate()
+                best_loss = eval_out.get("eval_loss", float("inf"))
+            return float(best_loss)
+        except Exception as exc:
+            print(f"  [batch] Training failed: {exc}")
+            return float("inf")
+
+    def act_controller(
+        model: object,
+        tokenizer: object,
+        cfg: dict,
+        batch_size: int = 50_000,
+        epsilon: float = 0.005,
+        max_batches: int = 4,
+        max_steps_override: int = -1,
+        output_dir: str = "/outputs",
+        # Legacy params kept for call-site compatibility but ignored:
+        data_path: str = "",
+        val_path: str = "",
+    ) -> float:
+        """
+        ACT (Auto-Train Controller): streams data in batches from HuggingFace,
+        stops when val loss improvement drops below epsilon.
+
+        Based on: ACT: Auto-Train for Code Translation Framework (2025)
+
+        Args:
+            model: LoRA-wrapped model.
+            tokenizer: Model tokenizer.
+            cfg: Training config dict.
+            batch_size: Number of examples per ACT batch (streamed from HF).
+            epsilon: Minimum val loss improvement required to continue.
+            max_batches: Hard ceiling on number of batches (budget guard).
+            max_steps_override: Passed through to train_on_batch for smoke tests.
+            output_dir: Directory for checkpoints.
+            data_path: Ignored (kept for backwards compat).
+            val_path: Ignored (kept for backwards compat).
+
+        Returns:
+            Best validation loss achieved across all batches.
+        """
+        print(f"\n[ACT] Streaming training data from HuggingFace "
+              f"batch_size={batch_size:,}  max_batches={max_batches}  ε={epsilon}")
+
+        # Stream a fixed validation set once — consistent across all ACT batches
+        print("[ACT] Streaming fixed validation set (5k examples at offset 50k)...")
+        val_records = stream_hf_val(n=5_000, skip=50_000)
+
+        best_val_loss = float("inf")
+        total_seen = 0
+
+        for batch_idx in range(max_batches):
+            torch.cuda.empty_cache()
+            print(f"\n[ACT] Streaming batch {batch_idx + 1}/{max_batches} from HuggingFace...")
+            batch = stream_hf_batch(batch_idx=batch_idx, batch_size=batch_size)
+
+            if not batch:
+                print(f"[ACT] No data returned for batch {batch_idx}. Stopping.")
+                break
+
+            total_seen += len(batch)
+            print(f"\n[ACT] Batch {batch_idx + 1}/{max_batches}: {len(batch):,} examples "
+                  f"(total seen: {total_seen:,})")
+
+            # Write val records to a temp in-memory path for train_on_batch
+            # We pass val records directly — reuse the existing helper but use
+            # a /tmp file so train_on_batch can load it via load_jsonl path.
+            import tempfile
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+            ) as tmp_val:
+                for rec in val_records:
+                    tmp_val.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                tmp_val_path = tmp_val.name
+
+            batch_val_loss = train_on_batch(
+                model,
+                tokenizer,
+                batch,
+                tmp_val_path,
+                cfg,
+                output_dir,
+                max_steps_override=max_steps_override,
+            )
+
+            improvement = best_val_loss - batch_val_loss
+            print(f"[ACT] Val loss: {batch_val_loss:.4f} | Best: {best_val_loss:.4f} "
+                  f"| Improvement: {improvement:.4f} | ε={epsilon}")
+
+            if batch_val_loss < best_val_loss:
+                best_val_loss = batch_val_loss
+
+            if batch_idx > 0 and improvement < epsilon:
+                print(f"[ACT] Improvement {improvement:.4f} < ε {epsilon}. "
+                      f"Data saturated. Stopping.")
+                break
+
+            print(f"[ACT] Still improving. Streaming next batch...")
+
+        print(f"\n[ACT] Final best val loss: {best_val_loss:.4f}")
+        return best_val_loss
 
     # -----------------------------------------------------------------------
     # 4b. Automated LR finder — exponential sweep 1e-7 → 1e-2 over 100 steps.
     #     Returns the LR at the point of steepest loss descent (maximum
     #     negative gradient of smoothed loss).  Falls back to
     #     cfg["learning_rate_fallback"] if the sweep fails for any reason.
+    #     The found LR is stored in cfg["_act_learning_rate"] so train_on_batch
+    #     can use it across all ACT batches.
     # -----------------------------------------------------------------------
     def find_learning_rate(
         model: object,
@@ -488,14 +946,24 @@ def train() -> None:
             print(f"[LRFinder] Sweep failed ({exc}); using fallback LR {fallback_lr:.0e}")
             return fallback_lr
 
-    # Run the LR finder
+    # Run the LR finder against a small warm-up slice to find initial LR.
+    # Stream 200 examples from HuggingFace (batch 0, truncated).
+    print("[LR stub] Streaming 200 examples from HuggingFace for LR finder...")
+    _lr_stub_records = stream_hf_batch(batch_idx=0, batch_size=200)
+    from datasets import Dataset as _HFDataset
+    _lr_stub_ds = _HFDataset.from_list(_lr_stub_records)
+    _lr_stub_formatted = _lr_stub_ds.map(format_chatml, remove_columns=_lr_stub_ds.column_names, num_proc=1)
+
     learning_rate = find_learning_rate(
         model,
-        train_ds,
+        _lr_stub_formatted,
         tokenizer,
         fallback_lr=cfg.get("learning_rate_fallback", 1e-4),
     )
     print(f"[AutoHP] learning_rate  : {learning_rate:.2e}")
+
+    # Store found LR in cfg so train_on_batch (called inside act_controller) can use it
+    cfg["_act_learning_rate"] = learning_rate
 
     # -----------------------------------------------------------------------
     # 5. Set up W&B (if enabled)
@@ -505,78 +973,59 @@ def train() -> None:
         wandb.init(
             project=cfg.get("wandb_project", "laguna-codealchemy"),
             name=cfg.get("run_name", "laguna-xs-codealchemy"),
-            config={**cfg, "learning_rate": learning_rate, "max_steps": max_steps},
+            config={
+                **cfg,
+                "learning_rate": learning_rate,
+                "act_batch_size": act_batch_size,
+                "act_epsilon": act_epsilon,
+                "act_max_batches": act_max_batches,
+            },
         )
         print(f"W&B run: {wandb.run.url}")
 
     # -----------------------------------------------------------------------
-    # 6. Configure and run SFTTrainer with automated strategies
+    # 6. Run ACT controller (or single-pass if use_act=False)
     # -----------------------------------------------------------------------
-    from transformers import EarlyStoppingCallback
-    from trl import SFTTrainer, SFTConfig
-
-    print("\nStarting SFT training with automated hyperparameters...")
+    print("\nStarting ACT-controlled training...")
     t0 = time.time()
 
-    sft_config = SFTConfig(
-        output_dir=OUTPUT_DIR,
-        # Epochs & steps — max_steps derived from dataset size at runtime
-        max_steps=max_steps,
-        num_train_epochs=cfg["max_epochs"],   # upper bound; early stopping may end it sooner
-        # Batch size — auto_find_batch_size lets TRL double from 1 until OOM
-        per_device_train_batch_size=cfg["per_device_train_batch_size"],
-        auto_find_batch_size=cfg.get("auto_find_batch_size", True),
-        gradient_accumulation_steps=cfg["gradient_accumulation_steps"],
-        # LR — auto-found above; cosine_with_restarts scheduler
-        learning_rate=learning_rate,
-        lr_scheduler_type=cfg.get("lr_scheduler", "cosine_with_restarts"),
-        warmup_ratio=cfg.get("warmup_ratio", 0.03),
-        weight_decay=cfg.get("weight_decay", 0.01),
-        optim=cfg.get("optim", "adamw_8bit"),
-        # Precision
-        fp16=cfg.get("fp16", False),
-        bf16=cfg.get("bf16", True),
-        # Gradient checkpointing
-        gradient_checkpointing=cfg.get("gradient_checkpointing", True),
-        # Early stopping requires eval_strategy + load_best_model_at_end
-        eval_strategy="steps",
-        eval_steps=cfg.get("eval_steps", 200),
-        load_best_model_at_end=cfg.get("load_best_model_at_end", True),
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        # Logging & saving
-        logging_steps=cfg.get("logging_steps", 50),
-        save_steps=cfg.get("eval_steps", 200),   # save on every eval
-        save_total_limit=cfg.get("save_total_limit", 2),
-        report_to=cfg.get("report_to", "none"),
-        run_name=cfg.get("run_name", "laguna-xs-codealchemy"),
-        # SFT-specific
-        max_seq_length=cfg["max_seq_length"],
-        packing=cfg.get("packing", True),
-        dataset_text_field="text",
-    )
-
-    early_stopping = EarlyStoppingCallback(
-        early_stopping_patience=cfg.get("early_stopping_patience", 3),
-    )
-
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        args=sft_config,
-        callbacks=[early_stopping],
-    )
-
-    # Train
-    train_result = trainer.train()
+    if use_act:
+        print(f"[ACT] mode=ON  batch_size={act_batch_size:,}  epsilon={act_epsilon}  max_batches={act_max_batches}")
+        final_val_loss = act_controller(
+            model=model,
+            tokenizer=tokenizer,
+            cfg=cfg,
+            output_dir=OUTPUT_DIR,
+            batch_size=act_batch_size,
+            epsilon=act_epsilon,
+            max_batches=act_max_batches,
+            max_steps_override=max_steps_override,
+        )
+    else:
+        # Legacy single-pass: stream one batch, train once (for smoke/debug)
+        print("[ACT] mode=OFF — single-pass training on one streamed batch")
+        all_records = stream_hf_batch(batch_idx=0, batch_size=act_batch_size)
+        val_records = stream_hf_val(n=2_000, skip=50_000)
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+        ) as tmp_val:
+            for rec in val_records:
+                tmp_val.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            tmp_val_path = tmp_val.name
+        final_val_loss = train_on_batch(
+            model=model,
+            tokenizer=tokenizer,
+            batch_records=all_records,
+            val_path_str=tmp_val_path,
+            cfg=cfg,
+            output_dir=OUTPUT_DIR,
+            max_steps_override=max_steps_override,
+        )
 
     elapsed = time.time() - t0
     print(f"\nTraining finished in {elapsed/3600:.2f} h")
-    print(f"Final training loss : {train_result.training_loss:.4f}")
-    print(f"Total steps         : {train_result.global_step:,}")
-    print(f"Samples/sec         : {train_result.metrics.get('train_samples_per_second', 'N/A')}")
+    print(f"Final best val loss : {final_val_loss:.4f}")
 
     # -----------------------------------------------------------------------
     # 7. Save LoRA adapter
@@ -591,8 +1040,7 @@ def train() -> None:
     summary = {
         "model_name": MODEL_NAME,
         "run_name": cfg.get("run_name", "laguna-xs-codealchemy"),
-        "final_loss": train_result.training_loss,
-        "global_step": train_result.global_step,
+        "final_val_loss": final_val_loss,
         "elapsed_hours": round(elapsed / 3600, 2),
         "gpu": "a100-40gb",
         "use_unsloth": USE_UNSLOTH,
@@ -602,12 +1050,15 @@ def train() -> None:
         "learning_rate": learning_rate,
         "lr_auto_found": True,
         "max_epochs": cfg["max_epochs"],
-        "max_steps_computed": max_steps,
         "early_stopping_patience": cfg.get("early_stopping_patience", 3),
         "per_device_batch_size": cfg["per_device_train_batch_size"],
         "auto_find_batch_size": cfg.get("auto_find_batch_size", True),
         "gradient_accumulation_steps": cfg["gradient_accumulation_steps"],
-        "num_training_examples": num_examples,
+        # ACT controller parameters
+        "act_enabled": use_act,
+        "act_batch_size": act_batch_size,
+        "act_epsilon": act_epsilon,
+        "act_max_batches": act_max_batches,
     }
     summary_path = Path(FINAL_ADAPTER_DIR) / "training_summary.json"
     with summary_path.open("w") as f:
@@ -622,7 +1073,7 @@ def train() -> None:
     # Finish W&B run
     if use_wandb:
         import wandb
-        wandb.log({"final_loss": train_result.training_loss})
+        wandb.log({"final_val_loss": final_val_loss})
         wandb.finish()
 
     print("\n=== Training complete ===")
@@ -633,13 +1084,26 @@ def train() -> None:
 # ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
-def main() -> None:
+def main(
+    max_steps: int = -1,
+    no_act: bool = False,
+    act_batch_size: int = 50_000,
+    act_epsilon: float = 0.005,
+    act_max_batches: int = 4,
+) -> None:
     """
     Trigger the remote training job.
 
     Run with:
-        modal run train.py            # blocks until done (prints logs live)
-        modal run train.py --detach   # fire-and-forget (recommended for long runs)
+        modal run train.py                               # blocks until done (prints logs live)
+        modal run train.py --detach                      # fire-and-forget (recommended for long runs)
+        modal run train.py --max-steps 50                # smoke test: stop after 50 steps
+        modal run train.py --no-act                      # disable ACT; single-pass on full dataset
+        modal run train.py --act-max-batches 2           # limit to 2 batches (100k examples)
+        modal run train.py --act-epsilon 0.01            # larger epsilon = stops sooner
+
+    Data volume is governed by the ACT controller (epsilon=0.005, max 4 batches = 200k examples).
+    No --limit flag needed; the ACT batch ceiling replaces it.
 
     Retrieve the adapter after training:
         modal volume get laguna-codealchemy-vol /outputs/final-adapter ./final-adapter
@@ -649,5 +1113,18 @@ def main() -> None:
     print("  Timeout : 7 hours")
     print("  Volume  : laguna-codealchemy-vol")
     print("  Output  : /outputs/final-adapter/")
+    print(f"  ACT     : {'OFF (single-pass)' if no_act else 'ON'}")
+    if not no_act:
+        print(f"  ACT batch size  : {act_batch_size:,}")
+        print(f"  ACT epsilon     : {act_epsilon}")
+        print(f"  ACT max batches : {act_max_batches}  (max {act_batch_size * act_max_batches:,} examples)")
+    if max_steps > 0:
+        print(f"  [Smoke] max-steps  : {max_steps}")
     print()
-    train.remote()
+    train.remote(
+        max_steps_override=max_steps,
+        use_act=not no_act,
+        act_batch_size=act_batch_size,
+        act_epsilon=act_epsilon,
+        act_max_batches=act_max_batches,
+    )

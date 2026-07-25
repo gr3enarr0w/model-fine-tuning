@@ -12,7 +12,7 @@ model_name: google/gemma-4-e4b-it
 lora_r: 16
 lora_alpha: 32          # 2 × r
 lora_dropout: 0.05
-lora_target_modules:
+target_modules:
   - q_proj
   - v_proj
   - k_proj
