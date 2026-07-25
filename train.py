@@ -494,7 +494,6 @@ def train(
                     _HF_CODEALCHEMY,
                     name=config_name,
                     streaming=True,
-                    trust_remote_code=True,
                 )
                 split = ds.get("train", ds[next(iter(ds))])
                 _collect(split, config_name, per_source, skip_per_source)
@@ -503,7 +502,7 @@ def train(
 
         # Stream WaltonFuture/agentic-sft-new
         try:
-            ds = load_dataset(_HF_AGENTIC, streaming=True, trust_remote_code=True)
+            ds = load_dataset(_HF_AGENTIC, streaming=True)
             split = ds.get("train", ds[next(iter(ds))])
             _collect(split, "__agentic__", per_source, skip_per_source)
         except Exception as exc:
@@ -512,11 +511,11 @@ def train(
         print(f"[HF] stream_hf_batch(idx={batch_idx}) → {len(records):,} records")
         return records
 
-    def stream_hf_val(n: int = 5_000, skip: int = 5_000_000) -> list[dict]:
+    def stream_hf_val(n: int = 5_000, skip: int = 50_000) -> list[dict]:
         """
         Stream a fixed validation set from HuggingFace.
 
-        Uses a consistent skip offset (default 5M) so the same examples are
+        Uses a consistent skip offset (default 50k) so the same examples are
         returned on every call regardless of which ACT batch is running.
 
         Args:
@@ -548,9 +547,9 @@ def train(
                 break
             try:
                 if config_name == "__agentic__":
-                    ds = load_dataset(ds_name, streaming=True, trust_remote_code=True)
+                    ds = load_dataset(ds_name, streaming=True)
                 else:
-                    ds = load_dataset(ds_name, name=config_name, streaming=True, trust_remote_code=True)
+                    ds = load_dataset(ds_name, name=config_name, streaming=True)
                 split = ds.get("train", ds[next(iter(ds))])
                 needed = min(per_source, n - len(records))
                 skipped = 0
@@ -755,8 +754,8 @@ def train(
               f"batch_size={batch_size:,}  max_batches={max_batches}  ε={epsilon}")
 
         # Stream a fixed validation set once — consistent across all ACT batches
-        print("[ACT] Streaming fixed validation set (5k examples at offset 5M)...")
-        val_records = stream_hf_val(n=5_000, skip=5_000_000)
+        print("[ACT] Streaming fixed validation set (5k examples at offset 50k)...")
+        val_records = stream_hf_val(n=5_000, skip=50_000)
 
         best_val_loss = float("inf")
         total_seen = 0
@@ -1002,7 +1001,7 @@ def train(
         # Legacy single-pass: stream one batch, train once (for smoke/debug)
         print("[ACT] mode=OFF — single-pass training on one streamed batch")
         all_records = stream_hf_batch(batch_idx=0, batch_size=act_batch_size)
-        val_records = stream_hf_val(n=2_000, skip=5_000_000)
+        val_records = stream_hf_val(n=2_000, skip=50_000)
         import tempfile
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
