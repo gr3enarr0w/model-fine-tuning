@@ -625,6 +625,7 @@ def train(
         formatted_batch = batch_ds.map(
             format_chatml,
             remove_columns=batch_ds.column_names,
+            num_proc=1,
         )
 
         # Load fixed validation set (written by dataset_prep.py)
@@ -632,7 +633,7 @@ def train(
         if val_path.exists():
             val_records = load_jsonl(val_path)
             val_ds_raw = HFDataset.from_list(val_records[:2000])  # cap at 2k for speed
-            eval_ds = val_ds_raw.map(format_chatml, remove_columns=val_ds_raw.column_names)
+            eval_ds = val_ds_raw.map(format_chatml, remove_columns=val_ds_raw.column_names, num_proc=1)
         else:
             # Fallback: carve 5% / max 500 from batch itself
             eval_size = min(500, max(1, int(len(formatted_batch) * 0.05)))
@@ -951,7 +952,7 @@ def train(
     _lr_stub_records = stream_hf_batch(batch_idx=0, batch_size=200)
     from datasets import Dataset as _HFDataset
     _lr_stub_ds = _HFDataset.from_list(_lr_stub_records)
-    _lr_stub_formatted = _lr_stub_ds.map(format_chatml, remove_columns=_lr_stub_ds.column_names)
+    _lr_stub_formatted = _lr_stub_ds.map(format_chatml, remove_columns=_lr_stub_ds.column_names, num_proc=1)
 
     learning_rate = find_learning_rate(
         model,
