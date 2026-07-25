@@ -50,6 +50,7 @@ volume = modal.Volume.from_name("laguna-codealchemy-vol", create_if_missing=True
 # installing it after the others lets pip resolve cleanly.
 image = (
     modal.Image.from_registry("nvidia/cuda:12.1.0-devel-ubuntu22.04", add_python="3.11")
+    .apt_install("libnvjitlink-12-1")
     .pip_install(
         # Core ML stack — pin torch to a CUDA 12.1 wheel that Unsloth expects
         "torch==2.4.1",
