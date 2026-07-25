@@ -2,6 +2,10 @@
 """
 dataset_prep.py — Laguna XS 2.1 QLoRA fine-tuning data preparation.
 
+Downloads the full available CodeAlchemy dataset (~873GB source, larger as JSONL)
+and all of WaltonFuture/agentic-sft-new. Requires ~1-2TB free disk space and
+several hours of download time. Run on a machine with sufficient storage.
+
 Downloads and prepares the full available training data via streaming (no OOM):
   - All available examples from open-alchemy/code-alchemy (weighted by type)
   - All available examples from WaltonFuture/agentic-sft-new

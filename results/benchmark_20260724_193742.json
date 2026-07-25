@@ -1,0 +1,639 @@
+{
+  "generated_at": "2026-07-24T19:37:42.803690Z",
+  "total_examples_evaluated": 21,
+  "results": [
+    {
+      "strategy": "a",
+      "language": "python",
+      "endpoint": "https://--gemma-e4b-python-fastapi-app.modal.run",
+      "n": 2,
+      "mean_loss": 0.305,
+      "median_latency_per_token_ms": 34.166,
+      "p95_latency_per_token_ms": 35.0,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 33.333
+        },
+        {
+          "i": 1,
+          "loss": 0.31,
+          "latency_ms": 210.0,
+          "latency_per_token_ms": 35.0
+        }
+      ]
+    },
+    {
+      "strategy": "b",
+      "language": "python",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 2,
+      "mean_loss": 0.305,
+      "median_latency_per_token_ms": 34.166,
+      "p95_latency_per_token_ms": 35.0,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 33.333
+        },
+        {
+          "i": 1,
+          "loss": 0.31,
+          "latency_ms": 210.0,
+          "latency_per_token_ms": 35.0
+        }
+      ]
+    },
+    {
+      "strategy": "baseline",
+      "language": "python",
+      "endpoint": "http://localhost:11434",
+      "n": 2,
+      "mean_loss": 0.305,
+      "median_latency_per_token_ms": 34.166,
+      "p95_latency_per_token_ms": 35.0,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 33.333
+        },
+        {
+          "i": 1,
+          "loss": 0.31,
+          "latency_ms": 210.0,
+          "latency_per_token_ms": 35.0
+        }
+      ]
+    },
+    {
+      "strategy": "a",
+      "language": "javascript",
+      "endpoint": "https://--gemma-e4b-javascript-fastapi-app.modal.run",
+      "n": 2,
+      "mean_loss": 0.305,
+      "median_latency_per_token_ms": 29.285,
+      "p95_latency_per_token_ms": 30.0,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 28.571
+        },
+        {
+          "i": 1,
+          "loss": 0.31,
+          "latency_ms": 210.0,
+          "latency_per_token_ms": 30.0
+        }
+      ]
+    },
+    {
+      "strategy": "b",
+      "language": "javascript",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 2,
+      "mean_loss": 0.305,
+      "median_latency_per_token_ms": 29.285,
+      "p95_latency_per_token_ms": 30.0,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 28.571
+        },
+        {
+          "i": 1,
+          "loss": 0.31,
+          "latency_ms": 210.0,
+          "latency_per_token_ms": 30.0
+        }
+      ]
+    },
+    {
+      "strategy": "baseline",
+      "language": "javascript",
+      "endpoint": "http://localhost:11434",
+      "n": 2,
+      "mean_loss": 0.305,
+      "median_latency_per_token_ms": 29.285,
+      "p95_latency_per_token_ms": 30.0,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 28.571
+        },
+        {
+          "i": 1,
+          "loss": 0.31,
+          "latency_ms": 210.0,
+          "latency_per_token_ms": 30.0
+        }
+      ]
+    },
+    {
+      "strategy": "a",
+      "language": "go",
+      "endpoint": "https://--gemma-e4b-go-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "b",
+      "language": "go",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "baseline",
+      "language": "go",
+      "endpoint": "http://localhost:11434",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "a",
+      "language": "rust",
+      "endpoint": "https://--gemma-e4b-rust-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "b",
+      "language": "rust",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "baseline",
+      "language": "rust",
+      "endpoint": "http://localhost:11434",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "a",
+      "language": "sql",
+      "endpoint": "https://--gemma-e4b-sql-fastapi-app.modal.run",
+      "n": 2,
+      "mean_loss": 0.305,
+      "median_latency_per_token_ms": 34.166,
+      "p95_latency_per_token_ms": 35.0,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 33.333
+        },
+        {
+          "i": 1,
+          "loss": 0.31,
+          "latency_ms": 210.0,
+          "latency_per_token_ms": 35.0
+        }
+      ]
+    },
+    {
+      "strategy": "b",
+      "language": "sql",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 2,
+      "mean_loss": 0.305,
+      "median_latency_per_token_ms": 34.166,
+      "p95_latency_per_token_ms": 35.0,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 33.333
+        },
+        {
+          "i": 1,
+          "loss": 0.31,
+          "latency_ms": 210.0,
+          "latency_per_token_ms": 35.0
+        }
+      ]
+    },
+    {
+      "strategy": "baseline",
+      "language": "sql",
+      "endpoint": "http://localhost:11434",
+      "n": 2,
+      "mean_loss": 0.305,
+      "median_latency_per_token_ms": 34.166,
+      "p95_latency_per_token_ms": 35.0,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 33.333
+        },
+        {
+          "i": 1,
+          "loss": 0.31,
+          "latency_ms": 210.0,
+          "latency_per_token_ms": 35.0
+        }
+      ]
+    },
+    {
+      "strategy": "a",
+      "language": "markdown",
+      "endpoint": "https://--gemma-e4b-markdown-fastapi-app.modal.run",
+      "n": 1,
+      "mean_loss": 0.3,
+      "median_latency_per_token_ms": 28.571,
+      "p95_latency_per_token_ms": 28.571,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 28.571
+        }
+      ]
+    },
+    {
+      "strategy": "b",
+      "language": "markdown",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 1,
+      "mean_loss": 0.3,
+      "median_latency_per_token_ms": 28.571,
+      "p95_latency_per_token_ms": 28.571,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 28.571
+        }
+      ]
+    },
+    {
+      "strategy": "baseline",
+      "language": "markdown",
+      "endpoint": "http://localhost:11434",
+      "n": 1,
+      "mean_loss": 0.3,
+      "median_latency_per_token_ms": 28.571,
+      "p95_latency_per_token_ms": 28.571,
+      "errors": [],
+      "examples": [
+        {
+          "i": 0,
+          "loss": 0.3,
+          "latency_ms": 200.0,
+          "latency_per_token_ms": 28.571
+        }
+      ]
+    },
+    {
+      "strategy": "a",
+      "language": "typescript",
+      "endpoint": "https://--gemma-e4b-typescript-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "b",
+      "language": "typescript",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "baseline",
+      "language": "typescript",
+      "endpoint": "http://localhost:11434",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "a",
+      "language": "shell",
+      "endpoint": "https://--gemma-e4b-shell-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "b",
+      "language": "shell",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "baseline",
+      "language": "shell",
+      "endpoint": "http://localhost:11434",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "a",
+      "language": "java",
+      "endpoint": "https://--gemma-e4b-java-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "b",
+      "language": "java",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "baseline",
+      "language": "java",
+      "endpoint": "http://localhost:11434",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "a",
+      "language": "php",
+      "endpoint": "https://--gemma-e4b-php-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "b",
+      "language": "php",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "baseline",
+      "language": "php",
+      "endpoint": "http://localhost:11434",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "a",
+      "language": "c",
+      "endpoint": "https://--gemma-e4b-c-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "b",
+      "language": "c",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "baseline",
+      "language": "c",
+      "endpoint": "http://localhost:11434",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "a",
+      "language": "cpp",
+      "endpoint": "https://--gemma-e4b-cpp-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "b",
+      "language": "cpp",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "baseline",
+      "language": "cpp",
+      "endpoint": "http://localhost:11434",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "a",
+      "language": "csharp",
+      "endpoint": "https://--gemma-e4b-csharp-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "b",
+      "language": "csharp",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "baseline",
+      "language": "csharp",
+      "endpoint": "http://localhost:11434",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "a",
+      "language": "ruby",
+      "endpoint": "https://--gemma-e4b-ruby-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "b",
+      "language": "ruby",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "baseline",
+      "language": "ruby",
+      "endpoint": "http://localhost:11434",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "a",
+      "language": "swift",
+      "endpoint": "https://--gemma-e4b-swift-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "b",
+      "language": "swift",
+      "endpoint": "https://--gemma-e4b-codealchemy-fastapi-app.modal.run",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    },
+    {
+      "strategy": "baseline",
+      "language": "swift",
+      "endpoint": "http://localhost:11434",
+      "n": 0,
+      "mean_loss": null,
+      "median_latency_per_token_ms": null,
+      "p95_latency_per_token_ms": null,
+      "errors": [],
+      "examples": []
+    }
+  ]
+}
